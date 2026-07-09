@@ -1,0 +1,32 @@
+# AWS Glue ETL Pipeline - Deployment Configuration
+# Copy this file to config.$(ENVIRONMENT).yaml and fill in values
+
+environment: dev
+aws_region: us-east-1
+
+# S3 Buckets (suffixes - account ID and environment will be appended)
+data_bucket_name: my-glue-data
+processed_bucket_name: my-glue-processed
+glue_artifacts_bucket: my-glue-artifacts
+lambda_artifacts_bucket: my-glue-lambda-artifacts
+cfn_templates_bucket: my-glue-cfn-templates
+
+# Glue Configuration
+glue_worker_type: G.1X
+glue_worker_count: 2
+glue_job_timeout: 60
+
+# Lambda Configuration
+lambda_memory_size: 256
+lambda_timeout: 120
+
+# SQS Configuration
+sqs_visibility_timeout: 300
+sqs_delay_seconds: 0
+
+# Monitoring
+log_retention_days: 30
+
+# GitHub Repository (for OIDC deployment role)
+github_repo_owner: your-github-org
+github_repo_name: your-repo-name

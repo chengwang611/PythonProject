@@ -1,0 +1,10 @@
+# Simple pipeline for CustomerReportProcessor
+- action: read
+  table: customers
+- action: filter
+  condition: "region = 'US'"
+- action: dropDuplicates
+  subset: ["customer_id"]
+- action: select
+  columns: [customer_id, name, region]
+

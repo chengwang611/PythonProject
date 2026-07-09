@@ -1,0 +1,41 @@
+# AWS ETL Pipeline - Deployment Configuration
+# Copy this file to config.$(ENVIRONMENT).yaml and fill in values
+
+environment: dev
+aws_region: us-east-1
+
+# S3 Buckets (suffixes - account ID and environment will be appended)
+data_bucket_name: my-etl-data
+processed_bucket_name: my-etl-processed
+emr_artifacts_bucket: my-etl-artifacts
+emr_log_bucket: my-etl-logs
+lambda_artifacts_bucket: my-etl-lambda-artifacts
+cfn_templates_bucket: my-etl-cfn-templates
+
+# EMR Configuration
+emr_release_label: emr-7.5.0
+emr_master_instance_type: m5.xlarge
+emr_core_instance_type: m5.xlarge
+emr_core_instance_count: 2
+emr_service_role: EMR_DefaultRole
+emr_ec2_role: EMR_EC2_DefaultRole
+emr_job_timeout: 3600
+
+# VPC Configuration (optional - leave empty to use default)
+vpc_id: ""
+subnet_id: ""
+
+# Lambda Configuration
+lambda_memory_size: 256
+lambda_timeout: 120
+
+# SQS Configuration
+sqs_visibility_timeout: 300
+sqs_delay_seconds: 0
+
+# Monitoring
+log_retention_days: 30
+
+# GitHub Repository (for OIDC deployment role)
+github_repo_owner: your-github-org
+github_repo_name: your-repo-name

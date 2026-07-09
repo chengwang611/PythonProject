@@ -1,0 +1,158 @@
+name: Deploy AWS ETL Pipeline
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'aws-etl-pipeline/**'
+      - '.github/workflows/deploy-etl-pipeline.yml'
+  pull_request:
+    branches: [main, master]
+    paths:
+      - 'aws-etl-pipeline/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  PYTHON_VERSION: '3.12'
+  AWS_REGION: us-east-1
+
+jobs:
+  validate:
+    name: Validate Templates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install cfn-lint
+        run: pip install cfn-lint
+
+      - name: Lint CloudFormation
+        run: |
+          cfn-lint aws-etl-pipeline/cloudformation/*.yaml
+
+      - name: Validate Lambda syntax
+        run: |
+          python -m py_compile aws-etl-pipeline/lambda/emr_trigger.py
+
+      - name: Validate PySpark syntax
+        run: |
+          python -m py_compile aws-etl-pipeline/emr-jobs/csv_etl_job.py
+
+  package:
+    name: Package and Upload
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Package Lambda
+        run: |
+          cd aws-etl-pipeline/lambda
+          pip install -r requirements.txt -t ./package
+          cp emr_trigger.py ./package/
+          cd package
+          zip -r9 ../emr-trigger-${{ github.event.inputs.environment || 'dev' }}.zip .
+          cd ..
+          rm -rf package
+          aws s3 cp emr-trigger-${{ github.event.inputs.environment || 'dev' }}.zip \
+            s3://${{ secrets.LAMBDA_ARTIFACTS_BUCKET }}/lambda/emr-trigger-${{ github.event.inputs.environment || 'dev' }}.zip
+
+      - name: Upload PySpark Job
+        run: |
+          aws s3 cp aws-etl-pipeline/emr-jobs/csv_etl_job.py \
+            s3://${{ secrets.EMR_ARTIFACTS_BUCKET }}/emr-jobs/csv_etl_job.py
+
+      - name: Upload CloudFormation Templates
+        run: |
+          aws s3 cp aws-etl-pipeline/cloudformation/main-stack.yaml \
+            s3://${{ secrets.CFN_TEMPLATES_BUCKET }}/etl-pipeline/main-stack.yaml
+
+  deploy:
+    name: Deploy CloudFormation Stack
+    needs: package
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy CloudFormation Stack
+        run: |
+          ENV_NAME="${{ github.event.inputs.environment || 'dev' }}"
+          STACK_NAME="etl-pipeline-${ENV_NAME}"
+
+          aws cloudformation deploy \
+            --template-file aws-etl-pipeline/cloudformation/main-stack.yaml \
+            --stack-name "${STACK_NAME}" \
+            --capabilities CAPABILITY_NAMED_IAM CAPABILITY_IAM \
+            --parameter-overrides \
+              EnvironmentName="${ENV_NAME}" \
+              LambdaS3Bucket="${{ secrets.LAMBDA_ARTIFACTS_BUCKET }}" \
+              EmrLogBucket="${{ secrets.EMR_LOG_BUCKET }}" \
+              EmrArtifactsBucket="${{ secrets.EMR_ARTIFACTS_BUCKET }}" \
+              DataBucketName="${{ secrets.DATA_BUCKET_NAME }}" \
+              ProcessedBucketName="${{ secrets.PROCESSED_BUCKET_NAME }}" \
+              GithubRepoOwner="${{ github.repository_owner }}" \
+              GithubRepoName="${{ github.event.repository.name }}" \
+              VpcId="${{ secrets.VPC_ID }}" \
+              SubnetId="${{ secrets.SUBNET_ID }}" \
+              EmrReleaseLabel="emr-7.5.0" \
+              EmrInstanceType="m5.xlarge" \
+              EmrCoreInstanceCount="2" \
+              LambdaMemorySize="256" \
+              LambdaTimeout="120" \
+              LogRetentionDays="30" \
+              SqsVisibilityTimeout="300" \
+              EmrJobTimeout="3600" \
+            --tags \
+              Environment="${ENV_NAME}" \
+              Project="ETL-Pipeline" \
+              ManagedBy="GitHubActions"
+
+      - name: Get Stack Outputs
+        run: |
+          ENV_NAME="${{ github.event.inputs.environment || 'dev' }}"
+          STACK_NAME="etl-pipeline-${ENV_NAME}"
+          aws cloudformation describe-stacks \
+            --stack-name "${STACK_NAME}" \
+            --query "Stacks[0].Outputs" \
+            --output table

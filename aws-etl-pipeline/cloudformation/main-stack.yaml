@@ -1,0 +1,499 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AWS ETL Pipeline - S3 Event → SQS → Lambda → EMR (PySpark)
+  Deploys the full infrastructure for CSV file ingestion and processing.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name used for resource naming.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID for EMR cluster (optional, uses default if not specified).
+    Default: ''
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet ID for EMR cluster (optional).
+    Default: ''
+
+  EmrReleaseLabel:
+    Type: String
+    Default: emr-7.5.0
+    Description: EMR release label (e.g., emr-7.5.0 for Spark 3.5).
+
+  EmrInstanceType:
+    Type: String
+    Default: m5.xlarge
+    Description: EC2 instance type for EMR core nodes.
+
+  EmrCoreInstanceCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 20
+    Description: Number of core instances for the EMR cluster.
+
+  EmrMasterInstanceType:
+    Type: String
+    Default: m5.xlarge
+    Description: EC2 instance type for EMR master node.
+
+  LambdaS3Bucket:
+    Type: String
+    Description: S3 bucket name where Lambda deployment packages are stored.
+
+  EmrLogBucket:
+    Type: String
+    Description: S3 bucket name for EMR logs.
+
+  EmrArtifactsBucket:
+    Type: String
+    Description: S3 bucket name for EMR job scripts and dependencies.
+
+  DataBucketName:
+    Type: String
+    Description: S3 bucket name where CSV files are dropped for ingestion.
+
+  ProcessedBucketName:
+    Type: String
+    Description: S3 bucket name where processed output is stored.
+
+  EmrServiceRole:
+    Type: String
+    Default: EMR_DefaultRole
+    Description: IAM role name for EMR service.
+
+  EmrEc2Role:
+    Type: String
+    Default: EMR_EC2_DefaultRole
+    Description: IAM role name for EMR EC2 instances.
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 key pair name for SSH access to EMR master node.
+    Default: ''
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    Description: CloudWatch log retention period in days.
+
+  SqsVisibilityTimeout:
+    Type: Number
+    Default: 300
+    Description: SQS message visibility timeout in seconds.
+
+  SqsDelaySeconds:
+    Type: Number
+    Default: 0
+    Description: SQS delivery delay in seconds.
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    MinValue: 128
+    MaxValue: 10240
+    Description: Lambda function memory size in MB.
+
+  LambdaTimeout:
+    Type: Number
+    Default: 120
+    MinValue: 1
+    MaxValue: 900
+    Description: Lambda function timeout in seconds.
+
+  EmrJobTimeout:
+    Type: Number
+    Default: 3600
+    Description: EMR step timeout in seconds.
+
+  GithubRepoOwner:
+    Type: String
+    Description: GitHub repository owner for OIDC authentication.
+
+  GithubRepoName:
+    Type: String
+    Description: GitHub repository name for OIDC authentication.
+
+Conditions:
+  HasVpcConfig: !Not [!Equals [!Ref VpcId, '']]
+  HasKeyPair: !Not [!Equals [!Ref KeyName, '']]
+
+Resources:
+  # ============================================================
+  # S3 BUCKETS
+  # ============================================================
+  DataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${DataBucketName}-${AWS::AccountId}-${EnvironmentName}'
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 90
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: s3:ObjectCreated:Put
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .csv
+            Queue: !GetAtt IngestionQueue.Arn
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  ProcessedBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${ProcessedBucketName}-${AWS::AccountId}-${EnvironmentName}'
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 90
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  EmrArtifactsBucketResource:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${EmrArtifactsBucket}-${AWS::AccountId}-${EnvironmentName}'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  EmrLogBucketResource:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${EmrLogBucket}-${AWS::AccountId}-${EnvironmentName}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ============================================================
+  # SQS QUEUE
+  # ============================================================
+  IngestionQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${EnvironmentName}-csv-ingestion-queue'
+      VisibilityTimeout: !Ref SqsVisibilityTimeout
+      DelaySeconds: !Ref SqsDelaySeconds
+      MessageRetentionPeriod: 1209600  # 14 days
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt IngestionDeadLetterQueue.Arn
+        maxReceiveCount: 5
+
+  IngestionDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${EnvironmentName}-csv-ingestion-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  # ============================================================
+  # SQS QUEUE POLICY (allow S3 to send messages)
+  # ============================================================
+  IngestionQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref IngestionQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt IngestionQueue.Arn
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:s3:::${DataBucket}-${AWS::AccountId}-${EnvironmentName}'
+
+  # ============================================================
+  # LAMBDA FUNCTION (SQS consumer → EMR trigger)
+  # ============================================================
+  EmrTriggerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-emr-trigger-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EmrTriggerLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt IngestionQueue.Arn
+              - Effect: Allow
+                Action:
+                  - elasticmapreduce:*
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${DataBucket}-${AWS::AccountId}-${EnvironmentName}'
+                  - !Sub 'arn:aws:s3:::${DataBucket}-${AWS::AccountId}-${EnvironmentName}/*'
+                  - !Sub 'arn:aws:s3:::${EmrArtifactsBucket}-${AWS::AccountId}-${EnvironmentName}'
+                  - !Sub 'arn:aws:s3:::${EmrArtifactsBucket}-${AWS::AccountId}-${EnvironmentName}/*'
+                  - !Sub 'arn:aws:s3:::${ProcessedBucket}-${AWS::AccountId}-${EnvironmentName}'
+                  - !Sub 'arn:aws:s3:::${ProcessedBucket}-${AWS::AccountId}-${EnvironmentName}/*'
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeVpcs
+                  - ec2:CreateTags
+                  - ec2:RunInstances
+                  - ec2:TerminateInstances
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/${EmrServiceRole}'
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/${EmrEc2Role}'
+
+  EmrTriggerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-emr-trigger'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt EmrTriggerLambdaRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      Code:
+        S3Bucket: !Ref LambdaS3Bucket
+        S3Key: !Sub 'lambda/emr-trigger-${EnvironmentName}.zip'
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref EnvironmentName
+          EMR_RELEASE_LABEL: !Ref EmrReleaseLabel
+          EMR_MASTER_INSTANCE_TYPE: !Ref EmrMasterInstanceType
+          EMR_CORE_INSTANCE_TYPE: !Ref EmrInstanceType
+          EMR_CORE_INSTANCE_COUNT: !Ref EmrCoreInstanceCount
+          EMR_SERVICE_ROLE: !Ref EmrServiceRole
+          EMR_EC2_ROLE: !Ref EmrEc2Role
+          EMR_LOG_URI: !Sub 's3://${EmrLogBucket}-${AWS::AccountId}-${EnvironmentName}/emr-logs/'
+          EMR_ARTIFACTS_BUCKET: !Sub '${EmrArtifactsBucket}-${AWS::AccountId}-${EnvironmentName}'
+          EMR_JOB_TIMEOUT: !Ref EmrJobTimeout
+          PROCESSED_BUCKET: !Sub '${ProcessedBucketName}-${AWS::AccountId}-${EnvironmentName}'
+          DATA_BUCKET: !Sub '${DataBucketName}-${AWS::AccountId}-${EnvironmentName}'
+          SUBNET_ID: !Ref SubnetId
+          VPC_ID: !Ref VpcId
+          KEY_NAME: !Ref KeyName
+          LOCK_BUCKET: !Sub '${ProcessedBucketName}-${AWS::AccountId}-${EnvironmentName}'
+          LOCK_EXPIRY_DAYS: '7'
+
+  # ============================================================
+  # LAMBDA EVENT SOURCE MAPPING (SQS trigger)
+  # ============================================================
+  LambdaEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      Enabled: true
+      EventSourceArn: !GetAtt IngestionQueue.Arn
+      FunctionName: !Ref EmrTriggerLambda
+      MaximumBatchingWindowInSeconds: 0
+
+  # ============================================================
+  # CLOUDWATCH LOG GROUP
+  # ============================================================
+  EmrTriggerLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Retain
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${EmrTriggerLambda}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ============================================================
+  # EMR CLUSTER SECURITY GROUP (if VPC is provided)
+  # ============================================================
+  EmrMasterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: HasVpcConfig
+    Properties:
+      GroupDescription: Security group for EMR master node
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8443
+          ToPort: 8443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-emr-master-sg'
+
+  EmrCoreSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: HasVpcConfig
+    Properties:
+      GroupDescription: Security group for EMR core/task nodes
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 0
+          ToPort: 65535
+          SourceSecurityGroupId: !Ref EmrMasterSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-emr-core-sg'
+
+  # ============================================================
+  # GITHUB OIDC ROLE FOR DEPLOYMENT
+  # ============================================================
+  GithubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-github-deploy-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub 'arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Sub 'repo:${GithubRepoOwner}/${GithubRepoName}:*'
+      Policies:
+        - PolicyName: DeployPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:*
+                  - s3:*
+                  - lambda:*
+                  - sqs:*
+                  - elasticmapreduce:*
+                  - iam:PassRole
+                  - iam:GetRole
+                  - iam:CreateRole
+                  - iam:PutRolePolicy
+                  - iam:AttachRolePolicy
+                  - logs:*
+                  - ec2:Describe*
+                Resource: '*'
+
+  # ============================================================
+  # OUTPUTS
+  # ============================================================
+Outputs:
+  DataBucketName:
+    Description: S3 bucket for incoming CSV files
+    Value: !Ref DataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DataBucket'
+
+  ProcessedBucketName:
+    Description: S3 bucket for processed output
+    Value: !Ref ProcessedBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessedBucket'
+
+  EmrArtifactsBucketName:
+    Description: S3 bucket for EMR job artifacts
+    Value: !Ref EmrArtifactsBucketResource
+    Export:
+      Name: !Sub '${AWS::StackName}-EmrArtifactsBucket'
+
+  IngestionQueueUrl:
+    Description: SQS queue URL for CSV ingestion events
+    Value: !Ref IngestionQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-IngestionQueueUrl'
+
+  IngestionQueueArn:
+    Description: SQS queue ARN for CSV ingestion events
+    Value: !GetAtt IngestionQueue.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-IngestionQueueArn'
+
+  IngestionDeadLetterQueueUrl:
+    Description: SQS dead letter queue URL
+    Value: !Ref IngestionDeadLetterQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-IngestionDLQUrl'
+
+  EmrTriggerLambdaArn:
+    Description: Lambda function ARN for triggering EMR jobs
+    Value: !GetAtt EmrTriggerLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EmrTriggerLambdaArn'
+
+  EmrTriggerLambdaName:
+    Description: Lambda function name for triggering EMR jobs
+    Value: !Ref EmrTriggerLambda
+    Export:
+      Name: !Sub '${AWS::StackName}-EmrTriggerLambdaName'
+
+  GithubDeployRoleArn:
+    Description: IAM role ARN for GitHub Actions deployment
+    Value: !GetAtt GithubDeployRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-GithubDeployRoleArn'
+
+  LockBucketName:
+    Description: S3 bucket used for distributed lock objects (exactly-once dedup)
+    Value: !Ref ProcessedBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-LockBucketName'

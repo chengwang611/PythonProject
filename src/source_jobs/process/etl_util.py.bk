@@ -1,0 +1,494 @@
+import logging
+import re
+from typing import Any, Callable, Dict, List, Optional, TypedDict
+
+from pyspark.sql import SparkSession, DataFrame, functions as F
+import boto3  # type: ignore
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Type aliases
+# ---------------------------------------------------------------------------
+QueryDict = Dict[str, str]
+FuncDict = Dict[str, Callable[..., Any]]
+
+
+# ---------------------------------------------------------------------------
+# Helper / placeholder functions
+# (Some of these are stubs so you can patch or replace them with your
+# real implementations.)
+# ---------------------------------------------------------------------------
+
+def replace_bucket_keys(path: str) -> str:
+    """Replace tokens in an S3 path (stub – override if needed)."""
+    return path
+
+
+def next_day(report_date: str, base_path: str) -> str:
+    """
+    Build the partition path for the given date.
+    The real implementation may be different; here we just append the date.
+    """
+    if base_path.endswith("/"):
+        return f"{base_path}{report_date}"
+    return f"{base_path}/{report_date}"
+
+
+def validate(df: DataFrame, view_name: str, empty_check: bool) -> None:
+    """Stub validation hook."""
+    return None
+
+
+def replace_empty_with_NULL_string(df: DataFrame) -> DataFrame:
+    """
+    Replace empty string values with NULL for all string columns.
+    This is deterministic and safe for tests.
+    """
+    string_cols = [
+        f.name for f in df.schema.fields if str(f.dataType) == "StringType"
+    ]
+    for c in string_cols:
+        df = df.withColumn(
+            c, F.when(F.col(c) == "", F.lit(None)).otherwise(F.col(c))
+        )
+    return df
+
+
+# These globals mirror what your screenshot shows – other helpers rely on them.
+scon_connection_url: Optional[str] = None
+scon_connection_username: Optional[str] = None
+scon_connection_password: Optional[str] = None
+scon_database: Optional[str] = None
+
+
+def execute_scon_query(
+    connection_url: str,
+    username: str,
+    password: str,
+    database: str,
+    query: str,
+) -> None:
+    """
+    Run an arbitrary SQL query against SQL Server.
+    Stub: patch in tests or provide a concrete implementation.
+    """
+    raise NotImplementedError(
+        "execute_scon_query must be patched in tests or implemented externally"
+    )
+
+
+def write_df_to_scon(
+    connection_url: str,
+    username: str,
+    password: str,
+    database: str,
+    table_name: str,
+    df: DataFrame,
+    columns: List[str],
+    batch_size: int = 1000,
+) -> None:
+    """
+    Bulk-write a DataFrame into SQL Server.
+    Stub: patch in tests or provide a concrete implementation.
+    """
+    raise NotImplementedError(
+        "write_df_to_scon must be patched in tests or implemented externally"
+    )
+
+
+def generate_sql_server_ddl(df: DataFrame, table_name: str) -> str:
+    """Very simple DDL generator for logging / testing."""
+    cols = []
+    for field in df.schema.fields:
+        dtype = "NVARCHAR(MAX)"  # simplified type mapping
+        cols.append(f"[{field.name}] {dtype}")
+    col_sql = ", ".join(cols)
+    return f"CREATE TABLE [{table_name}] ({col_sql});"
+
+
+# ---------------------------------------------------------------------------
+# MSSQL → Spark
+# ---------------------------------------------------------------------------
+
+def load_mssql_view_as_df(
+    spark: SparkSession,
+    mssql_config: Dict[str, str],
+    table_name: str,
+    query: str,
+) -> DataFrame:
+    """
+    Load an arbitrary query from SQL Server as a DataFrame (via JDBC).
+    """
+    global scon_connection_url, scon_connection_username, scon_connection_password, scon_database
+    try:
+        logger.info(f"read view {table_name} from MSSQL start")
+        scon_connection_url = mssql_config["connection_url"]
+        scon_connection_username = mssql_config["username"]
+        scon_connection_password = mssql_config["password"]
+        scon_database = mssql_config["database"]
+
+        df = (
+            spark.read.format("jdbc")
+            .option("url", scon_connection_url)
+            .option("dbtable", f"({query}) AS t")
+            .option("user", scon_connection_username)
+            .option("password", scon_connection_password)
+            .option("driver", "com.microsoft.sqlserver.jdbc.SQLServerDriver")
+            .load()
+        )
+
+        logger.info(f"read view {table_name} from MSSQL end")
+        return df
+    except Exception as e:  # pragma: no cover
+        logger.error(f"✗ Failed to read view {table_name} from MSSQL: {e}")
+        raise
+
+
+def load_mssql_table_as_spark_temp_table(
+    spark: SparkSession,
+    mssql_config: Dict[str, str],
+    table_name: str,
+    report_date: str,
+    temp_table_name: str,
+) -> None:
+    """Load MSSQL table for REPORT_DATE into a temp view."""
+    query = f"SELECT * FROM {table_name} WHERE REPORT_DATE = '{report_date}'"
+    df = load_mssql_view_as_df(spark, mssql_config, table_name, query)
+    df.printSchema()
+    df.show()
+    df.createOrReplaceTempView(temp_table_name)
+
+
+def load_mssql_table_as_spark_temp_table_native(
+    spark: SparkSession,
+    mssql_config: Dict[str, str],
+    table_name: str,
+    report_date: str,
+    temp_table_name: str,
+) -> None:
+    """Alternative native JDBC implementation (matches your screenshot)."""
+    host_port = mssql_config["connection_url"]
+    df = (
+        spark.read.format("jdbc")
+        .option("url", host_port)
+        .option("database", mssql_config["database"])
+        .option("user", mssql_config["username"])
+        .option("password", mssql_config["password"])
+        .option("driver", "com.microsoft.sqlserver.jdbc.SQLServerDriver")
+        .option(
+            "dbtable",
+            f"(SELECT * FROM {table_name} WHERE REPORT_DATE = '{report_date}') AS t",
+        )
+        .option("fetchsize", "5000")
+        .load()
+    )
+    df.printSchema()
+    df.show()
+    df.createOrReplaceTempView(temp_table_name)
+
+
+# ---------------------------------------------------------------------------
+# Spark → MSSQL
+# ---------------------------------------------------------------------------
+
+def write_view_to_mssql(
+    spark: SparkSession,
+    view_name: str,
+    mssql_config: Dict[str, str],
+    table_config: Dict[str, Any],
+    report_date: str,
+) -> None:
+    """
+    Write a Spark temp view back to MSSQL table.
+    Mirrors the logic from your screenshot.
+    """
+    try:
+        valid_views = [t.name for t in spark.catalog.listTables()]
+        if view_name not in valid_views:
+            raise ValueError(f"Invalid or unregistered view name: {view_name}")
+
+        table_name = table_config["table_name"]
+        df = spark.table(view_name)
+
+        if "REPORT_DATE" in df.columns:
+            df = df.withColumn(
+                "REPORT_DATE",
+                F.to_date(F.col("REPORT_DATE"), format="yyyy-MM-dd"),
+            )
+
+        df = replace_empty_with_NULL_string(df)
+        columns = df.columns
+
+        ddl = generate_sql_server_ddl(df, table_name=table_name)
+        logger.info(f"table ddl is: {ddl}")
+
+        query_clear = (
+            f"DELETE FROM {table_name} WHERE REPORT_DATE = '{report_date}'"
+        )
+        logger.info(f"executing clear query: {query_clear}")
+
+        execute_scon_query(
+            mssql_config["connection_url"],
+            mssql_config["username"],
+            mssql_config["password"],
+            mssql_config["database"],
+            query_clear,
+        )
+
+        logger.info(f"Writing view {view_name} to MSSQL table {table_name}")
+        write_df_to_scon(
+            mssql_config["connection_url"],
+            mssql_config["username"],
+            mssql_config["password"],
+            mssql_config["database"],
+            table_name,
+            df,
+            columns=columns,
+            batch_size=table_config.get("batch_size", 1000),
+        )
+        logger.info(f"✓ Wrote view {view_name} to MSSQL table {table_name}")
+    except Exception as e:  # pragma: no cover
+        logger.error(f"✗ Failed to write view {view_name} to MSSQL: {e}")
+        raise
+
+
+# ---------------------------------------------------------------------------
+# S3 → Spark views
+# ---------------------------------------------------------------------------
+
+def load_views_from_partition(
+    s3_client: Any,
+    spark: SparkSession,
+    s3_base_path: str,
+    file_config: List[Dict[str, Any]],
+    report_date: str,
+    mssql_config: Optional[Dict[str, str]] = None,
+    upper_col_name: bool = False,
+) -> None:
+    """
+    Create temp views from S3 parquet/csv partitions.
+    """
+    s3_base_path = replace_bucket_keys(s3_base_path)
+
+    for file in file_config:
+        view_name = file["view_name"].upper()
+        empty_check = file.get("empty_check", False)
+        try:
+            logger.info(f"Started create view: {view_name}")
+            if file["format"] == "parquet":
+                date_partition_key = file["date_partition_key"]
+                s3_path = file["path"]
+                full_path = (
+                    f"{s3_base_path}{s3_path}/{date_partition_key}={report_date}"
+                )
+                logger.info(f"************ full_path: {full_path}")
+                df = spark.read.format("parquet").load(full_path)
+            elif file["format"] == "csv":
+                full_path = f"{s3_base_path}{file['path']}/{report_date}.csv"
+                df = (
+                    spark.read.format("csv")
+                    .option("header", "true")
+                    .option("quote", '"')
+                    .load(full_path)
+                )
+            else:
+                raise ValueError(f"Unsupported file format: {file['format']}")
+
+            validate(df, view_name, empty_check)
+
+            if upper_col_name:
+                new_cols = [c.upper() for c in df.columns]
+                df = df.toDF(*new_cols)
+
+            df = replace_empty_with_NULL_string(df)
+            df.createOrReplaceTempView(view_name)
+            df.printSchema()
+            df.show(10, False)
+            logger.info(f"✓ Created view {view_name} from {full_path}")
+        except Exception as e:  # pragma: no cover
+            logger.error(f"✗ Failed to load view {view_name}: {e}")
+            raise
+
+
+# ---------------------------------------------------------------------------
+# Generic SQL execution
+# ---------------------------------------------------------------------------
+
+def execute_sql(
+    spark: SparkSession,
+    view_name: str,
+    sql_query: str,
+) -> None:
+    """Run a Spark SQL statement and register result as a temp view."""
+    logger.info(f"raw sql: {sql_query}")
+    df = spark.sql(sql_query)
+    df.createOrReplaceTempView(view_name)
+    logger.info(f"Created / replaced view {view_name} using SQL")
+
+
+# ---------------------------------------------------------------------------
+# Step-driven orchestration
+# ---------------------------------------------------------------------------
+
+class ProcessConfig(TypedDict, total=False):
+    steps: List[Dict[str, Any]]
+
+
+def process_steps(
+    s3_client: Any,
+    spark: SparkSession,
+    report_date: str,
+    config: ProcessConfig,
+    mssql_config: Dict[str, str],
+    querys: QueryDict,
+    functions: FuncDict,
+    use_native_table_loads: bool = False,
+) -> None:
+    """
+    Drive ETL based on the list of steps in `config["steps"]`.
+    Matches the control flow in your screenshot.
+    """
+    try:
+        for step in config.get("steps", []):
+            func_name = step.get("function")
+            if func_name == "load_views":
+                load_views_from_partition(
+                    s3_client,
+                    spark,
+                    step["s3_base_path"],
+                    step["files"],
+                    report_date,
+                    mssql_config,
+                    True,
+                )
+            elif func_name == "load_table":
+                if use_native_table_loads:
+                    load_mssql_table_as_spark_temp_table_native(
+                        spark,
+                        mssql_config,
+                        step["table"],
+                        report_date,
+                        step["temp_table"],
+                    )
+                else:
+                    load_mssql_table_as_spark_temp_table(
+                        spark,
+                        mssql_config,
+                        step["table"],
+                        report_date,
+                        step["temp_table"],
+                    )
+            elif func_name == "execute_sql":
+                execute_sql(spark, step["view_name"], step["sql"])
+            elif func_name == "execute_sql_by_name":
+                query = querys[step["view_name"]]
+                execute_sql(spark, step["view_name"], query)
+            elif func_name == "execute_pyspark_function_by_name":
+                function_name = step["function_name"]
+                input_view_name = step["function_input_view_name"]
+                output_view_name = step["function_output_view_name"]
+                func = functions.get(function_name)
+                if func:
+                    func(spark, input_view_name, output_view_name, report_date)
+            elif func_name == "write_view_to_mssql":
+                logger.info("write_view_to_mssql")
+                write_view_to_mssql(
+                    spark,
+                    step["view"],
+                    mssql_config,
+                    step["table_config"],
+                    report_date,
+                )
+                logger.info("✓ ETL job completed successfully.")
+    except Exception as e:  # pragma: no cover
+        logger.error(f"✗ ETL job failed: {e}")
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Config initialisation (Spark / MSSQL / S3)
+# ---------------------------------------------------------------------------
+
+def get_config_root(vault_file: str) -> Dict[str, Any]:
+    """Stub – load your Vault / properties config here."""
+    raise NotImplementedError(
+        "get_config_root must be patched in tests or implemented externally"
+    )
+
+
+def get_spark_session_v2(
+    app_name: str,
+    master_url: str,
+    driver_memory: str,
+    executor_memory: str,
+    driver_cores: int,
+    executor_cores: int,
+    max_number_of_executors: int,
+) -> SparkSession:
+    """Stub – create SparkSession.builder...getOrCreate() in real code."""
+    raise NotImplementedError(
+        "get_spark_session_v2 must be patched in tests or implemented externally"
+    )
+
+
+def process_configs(
+    job_name: str,
+    vault_env: str,
+    report_yaml_path: str,
+    file_date: str,
+):
+    """
+    Read Vault config, build MSSQL config, create SparkSession & S3 client.
+    Returns (spark, mssql_config, report_yaml_full_path, s3_client).
+    """
+    vault_file = "/rbc_vault/secrets/reports_activity_pr1.properties"
+    config = get_config_root(vault_file)
+    root = config["root"]
+
+    master_url = root["MASTER_URL"]
+    driver_memory = root["SPARK_L2_DRIVER_MEMORY"]
+    executor_memory = root["SPARK_L2_EXECUTOR_MEMORY"]
+    driver_cores = root["SPARK_ML_D_I_CORES"]
+    executor_cores = root["SPARK_ML_E_I_CORES"]
+    max_number_of_executors = root["MAX_NUMBER_OF_EXECUTORS"]
+
+    s3_key = root["AWS_ACCESS_KEY_ID"]
+    s3_password = root["AWS_SECRET_ACCESS_KEY"]
+    endpoint = root["END_POINT"]
+
+    mssql_config = {
+        "connection_url": root["mssql_connection_url"],
+        "username": root["mssql_username"],
+        "password": root["mssql_pwd"],
+        "database": root["mssql_db"],
+    }
+
+    app_name = re.sub(
+        pattern=r"\{v\}",
+        repl=vault_env,
+        string=job_name + "_etl_" + file_date,
+    )
+    logger.info(f"app_name[{app_name}]")
+
+    spark = get_spark_session_v2(
+        app_name,
+        master_url,
+        driver_memory,
+        executor_memory,
+        driver_cores,
+        executor_cores,
+        max_number_of_executors,
+    )
+
+    report_yaml_full_path = report_yaml_path
+    logger.info(f"report_yaml_full_path[{report_yaml_full_path}]")
+
+    s3_client = boto3.client(
+        "s3",
+        aws_access_key_id=s3_key,
+        aws_secret_access_key=s3_password,
+        endpoint_url=endpoint,
+    )
+
+    return spark, mssql_config, report_yaml_full_path, s3_client

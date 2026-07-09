@@ -1,0 +1,12 @@
+# Simple pipeline for InventoryReportProcessor
+- action: read
+  table: inventory
+- action: filter
+  condition: "warehouse = 'A'"
+- action: aggregate
+  groupBy: [product_name]
+  aggregations:
+    quantity: sum
+- action: write
+  table: inventory_aggregated
+

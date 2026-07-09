@@ -1,0 +1,1083 @@
+"""
+Comprehensive unit tests for etl_util module with Sonar compliance.
+Tests cover all functions including edge cases, error handling, and logging.
+"""
+import sys
+import unittest
+from unittest.mock import MagicMock, patch, call, Mock
+from typing import Any, Dict, List
+import logging
+
+# Add parent paths for imports
+sys.path.insert(0, '/Users/chengwang/PycharmProjects/PythonProject/copilot-test')
+
+from etls.reports import etl_util
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType
+
+# Configure logging for tests
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+
+class TestReplaceBucketKeys(unittest.TestCase):
+    """Test replace_bucket_keys function."""
+
+    def test_replace_bucket_keys_identity(self):
+        """Test that function returns input unchanged (stub behavior)."""
+        path = "s3://bucket/path/to/data"
+        result = etl_util.replace_bucket_keys(path)
+        self.assertEqual(result, path)
+
+    def test_replace_bucket_keys_empty_string(self):
+        """Test with empty string."""
+        result = etl_util.replace_bucket_keys("")
+        self.assertEqual(result, "")
+
+    def test_replace_bucket_keys_with_tokens(self):
+        """Test with token-like string (stub returns unchanged)."""
+        path = "s3://bucket/{date}/data"
+        result = etl_util.replace_bucket_keys(path)
+        self.assertEqual(result, path)
+
+
+class TestNextDay(unittest.TestCase):
+    """Test next_day function."""
+
+    def test_next_day_with_trailing_slash(self):
+        """Test path concatenation with trailing slash."""
+        result = etl_util.next_day("2025-12-03", "s3://bucket/data/")
+        self.assertEqual(result, "s3://bucket/data/2025-12-03")
+
+    def test_next_day_without_trailing_slash(self):
+        """Test path concatenation without trailing slash."""
+        result = etl_util.next_day("2025-12-03", "s3://bucket/data")
+        self.assertEqual(result, "s3://bucket/data/2025-12-03")
+
+    def test_next_day_empty_path(self):
+        """Test with empty base path."""
+        result = etl_util.next_day("2025-12-03", "")
+        self.assertEqual(result, "/2025-12-03")
+
+    def test_next_day_root_path(self):
+        """Test with root path."""
+        result = etl_util.next_day("2025-12-03", "/")
+        self.assertEqual(result, "/2025-12-03")
+
+
+class TestValidate(unittest.TestCase):
+    """Test validate function."""
+
+    def test_validate_returns_none(self):
+        """Test that validate returns None (stub behavior)."""
+        mock_df = MagicMock(spec=DataFrame)
+        result = etl_util.validate(mock_df, "VIEW", True)
+        self.assertIsNone(result)
+
+    def test_validate_with_empty_check_false(self):
+        """Test with empty_check=False."""
+        mock_df = MagicMock(spec=DataFrame)
+        result = etl_util.validate(mock_df, "VIEW", False)
+        self.assertIsNone(result)
+
+
+class TestReplaceEmptyWithNULLString(unittest.TestCase):
+    """Test replace_empty_with_NULL_string function."""
+
+    @patch('etls.reports.etl_util.F')
+    def test_replace_empty_with_null_string_no_string_cols(self, mock_f):
+        """Test DataFrame with no string columns."""
+        mock_df = MagicMock(spec=DataFrame)
+        mock_df.schema.fields = [
+            MagicMock(name="id", dataType="IntegerType"),
+            MagicMock(name="amount", dataType="DoubleType"),
+        ]
+        mock_df.withColumn.return_value = mock_df
+
+        result = etl_util.replace_empty_with_NULL_string(mock_df)
+        self.assertEqual(result, mock_df)
+        # Should not call withColumn for non-string columns
+        mock_df.withColumn.assert_not_called()
+
+    @patch('etls.reports.etl_util.F')
+    def test_replace_empty_with_null_string_with_string_cols(self, mock_f):
+        """Test DataFrame with string columns."""
+        mock_df = MagicMock(spec=DataFrame)
+        mock_field = MagicMock()
+        mock_field.name = "name"
+        mock_field.dataType = StringType()
+
+        mock_df.schema.fields = [mock_field]
+        mock_df.withColumn.return_value = mock_df
+
+        result = etl_util.replace_empty_with_NULL_string(mock_df)
+        self.assertEqual(result, mock_df)
+
+
+class TestGenerateSqlServerDDL(unittest.TestCase):
+    """Test generate_sql_server_ddl function."""
+
+    def test_generate_ddl_single_column(self):
+        """Test DDL generation for single column."""
+        mock_df = MagicMock(spec=DataFrame)
+        mock_field = MagicMock()
+        mock_field.name = "column1"
+        mock_field.dataType = StringType()
+
+        mock_df.schema.fields = [mock_field]
+
+        result = etl_util.generate_sql_server_ddl(mock_df, "test_table")
+
+        self.assertIn("CREATE TABLE [test_table]", result)
+        self.assertIn("[column1]", result)
+        self.assertIn("NVARCHAR(MAX)", result)
+
+    def test_generate_ddl_multiple_columns(self):
+        """Test DDL generation for multiple columns."""
+        mock_df = MagicMock(spec=DataFrame)
+        mock_field1 = MagicMock()
+        mock_field1.name = "id"
+        mock_field2 = MagicMock()
+        mock_field2.name = "name"
+
+        mock_df.schema.fields = [mock_field1, mock_field2]
+
+        result = etl_util.generate_sql_server_ddl(mock_df, "users")
+
+        self.assertIn("CREATE TABLE [users]", result)
+        self.assertIn("[id]", result)
+        self.assertIn("[name]", result)
+
+    def test_generate_ddl_empty_table(self):
+        """Test DDL generation for table with no columns."""
+        mock_df = MagicMock(spec=DataFrame)
+        mock_df.schema.fields = []
+
+        result = etl_util.generate_sql_server_ddl(mock_df, "empty_table")
+
+        self.assertIn("CREATE TABLE [empty_table]", result)
+        self.assertIn("()", result)
+
+
+class TestExecuteSconQuery(unittest.TestCase):
+    """Test execute_scon_query function."""
+
+    def test_execute_scon_query_not_implemented(self):
+        """Test that execute_scon_query raises NotImplementedError."""
+        with self.assertRaises(NotImplementedError) as context:
+            etl_util.execute_scon_query(
+                "jdbc:sqlserver://host",
+                "user",
+                "password",
+                "database",
+                "SELECT * FROM table"
+            )
+        self.assertIn("must be patched", str(context.exception))
+
+
+class TestWriteDFToScon(unittest.TestCase):
+    """Test write_df_to_scon function."""
+
+    def test_write_df_to_scon_not_implemented(self):
+        """Test that write_df_to_scon raises NotImplementedError."""
+        mock_df = MagicMock(spec=DataFrame)
+        with self.assertRaises(NotImplementedError) as context:
+            etl_util.write_df_to_scon(
+                "jdbc:sqlserver://host",
+                "user",
+                "password",
+                "database",
+                "test_table",
+                mock_df,
+                ["col1", "col2"]
+            )
+        self.assertIn("must be patched", str(context.exception))
+
+    def test_write_df_to_scon_with_batch_size(self):
+        """Test write_df_to_scon with custom batch size."""
+        mock_df = MagicMock(spec=DataFrame)
+        with self.assertRaises(NotImplementedError):
+            etl_util.write_df_to_scon(
+                "jdbc:sqlserver://host",
+                "user",
+                "password",
+                "database",
+                "test_table",
+                mock_df,
+                ["col1", "col2"],
+                batch_size=5000
+            )
+
+
+class TestLoadMSSQLViewAsDF(unittest.TestCase):
+    """Test load_mssql_view_as_df function."""
+
+    @patch('etls.reports.etl_util.logger')
+    def test_load_mssql_view_as_df_success(self, mock_logger):
+        """Test successful MSSQL view load."""
+        mock_spark = MagicMock(spec=SparkSession)
+        mock_reader = MagicMock()
+        mock_spark.read.format.return_value = mock_reader
+        mock_reader.option.return_value = mock_reader
+        mock_reader.load.return_value = MagicMock(spec=DataFrame)
+
+        mssql_config = {
+            "connection_url": "jdbc:sqlserver://host:1433",
+            "username": "user",
+            "password": "pwd",
+            "database": "testdb"
+        }
+
+        result = etl_util.load_mssql_view_as_df(
+            mock_spark,
+            mssql_config,
+            "test_view",
+            "SELECT * FROM test"
+        )
+
+        self.assertIsNotNone(result)
+        mock_spark.read.format.assert_called_with("jdbc")
+        mock_logger.info.assert_called()
+
+    @patch('etls.reports.etl_util.logger')
+    def test_load_mssql_view_as_df_failure(self, mock_logger):
+        """Test MSSQL view load failure."""
+        mock_spark = MagicMock(spec=SparkSession)
+        mock_spark.read.format.side_effect = Exception("Connection error")
+
+        mssql_config = {
+            "connection_url": "jdbc:sqlserver://host:1433",
+            "username": "user",
+            "password": "pwd",
+            "database": "testdb"
+        }
+
+        with self.assertRaises(Exception):
+            etl_util.load_mssql_view_as_df(
+                mock_spark,
+                mssql_config,
+                "test_view",
+                "SELECT * FROM test"
+            )
+
+        mock_logger.error.assert_called()
+
+
+class TestLoadMSSQLTableAsSparkTempTable(unittest.TestCase):
+    """Test load_mssql_table_as_spark_temp_table function."""
+
+    @patch('etls.reports.etl_util.load_mssql_view_as_df')
+    def test_load_mssql_table_as_spark_temp_table_success(self, mock_load_view):
+        """Test successful load to temp table."""
+        mock_spark = MagicMock(spec=SparkSession)
+        mock_df = MagicMock(spec=DataFrame)
+        mock_load_view.return_value = mock_df
+
+        mssql_config = {
+            "connection_url": "jdbc:sqlserver://host:1433",
+            "username": "user",
+            "password": "pwd",
+            "database": "testdb"
+        }
+
+        etl_util.load_mssql_table_as_spark_temp_table(
+            mock_spark,
+            mssql_config,
+            "source_table",
+            "2025-12-03",
+            "temp_view"
+        )
+
+        mock_load_view.assert_called_once()
+        mock_df.printSchema.assert_called_once()
+        mock_df.show.assert_called_once()
+        mock_df.createOrReplaceTempView.assert_called_with("temp_view")
+
+
+class TestLoadMSSQLTableAsSparkTempTableNative(unittest.TestCase):
+    """Test load_mssql_table_as_spark_temp_table_native function."""
+
+    def test_load_mssql_table_native_success(self):
+        """Test native JDBC load to temp table."""
+        mock_spark = MagicMock(spec=SparkSession)
+        mock_reader = MagicMock()
+        mock_spark.read.format.return_value = mock_reader
+        mock_reader.option.return_value = mock_reader
+        mock_df = MagicMock(spec=DataFrame)
+        mock_reader.load.return_value = mock_df
+
+        mssql_config = {
+            "connection_url": "jdbc:sqlserver://host:1433",
+            "username": "user",
+            "password": "pwd",
+            "database": "testdb"
+        }
+
+        etl_util.load_mssql_table_as_spark_temp_table_native(
+            mock_spark,
+            mssql_config,
+            "source_table",
+            "2025-12-03",
+            "temp_view"
+        )
+
+        mock_spark.read.format.assert_called_with("jdbc")
+        mock_df.createOrReplaceTempView.assert_called_with("temp_view")
+
+
+class TestWriteViewToMSSQL(unittest.TestCase):
+    """Test write_view_to_mssql function."""
+
+    @patch('etls.reports.etl_util.F')
+    @patch('etls.reports.etl_util.execute_scon_query')
+    @patch('etls.reports.etl_util.write_df_to_scon')
+    @patch('etls.reports.etl_util.replace_empty_with_NULL_string')
+    @patch('etls.reports.etl_util.generate_sql_server_ddl')
+    @patch('etls.reports.etl_util.logger')
+    def test_write_view_to_mssql_success(
+        self, mock_logger, mock_ddl, mock_replace_empty,
+        mock_write_scon, mock_execute_scon, mock_f
+    ):
+        """Test successful write to MSSQL."""
+        mock_spark = MagicMock(spec=SparkSession)
+        mock_df = MagicMock(spec=DataFrame)
+        mock_df.columns = ["col1", "col2", "REPORT_DATE"]
+        mock_df.withColumn.return_value = mock_df
+
+        mock_table = MagicMock()
+        mock_table.name = "temp_view"
+        mock_spark.catalog.listTables.return_value = [mock_table]
+        mock_spark.table.return_value = mock_df
+
+        mock_replace_empty.return_value = mock_df
+        mock_ddl.return_value = "CREATE TABLE..."
+
+        # Mock F functions
+        mock_f.to_date.return_value = MagicMock()
+        mock_f.col.return_value = MagicMock()
+        mock_f.when.return_value = MagicMock()
+        mock_f.lit.return_value = MagicMock()
+
+        mssql_config = {
+            "connection_url": "jdbc:sqlserver://host",
+            "username": "user",
+            "password": "pwd",
+            "database": "testdb"
+        }
+
+        table_config = {
+            "table_name": "output_table",
+            "batch_size": 1000
+        }
+
+        etl_util.write_view_to_mssql(
+            mock_spark,
+            "temp_view",
+            mssql_config,
+            table_config,
+            "2025-12-03"
+        )
+
+        mock_execute_scon.assert_called_once()
+        mock_write_scon.assert_called_once()
+
+    @patch('etls.reports.etl_util.logger')
+    def test_write_view_to_mssql_invalid_view(self, mock_logger):
+        """Test write with invalid view name."""
+        mock_spark = MagicMock(spec=SparkSession)
+        mock_table = MagicMock()
+        mock_table.name = "other_view"
+        mock_spark.catalog.listTables.return_value = [mock_table]
+
+        mssql_config = {
+            "connection_url": "jdbc:sqlserver://host",
+            "username": "user",
+            "password": "pwd",
+            "database": "testdb"
+        }
+
+        table_config = {"table_name": "output_table"}
+
+        with self.assertRaises(ValueError):
+            etl_util.write_view_to_mssql(
+                mock_spark,
+                "invalid_view",
+                mssql_config,
+                table_config,
+                "2025-12-03"
+            )
+
+        mock_logger.error.assert_called()
+
+
+class TestLoadViewsFromPartition(unittest.TestCase):
+    @patch('etls.reports.etl_util.replace_bucket_keys')
+    @patch('etls.reports.etl_util.validate')
+    @patch('etls.reports.etl_util.replace_empty_with_NULL_string')
+    @patch('etls.reports.etl_util.logger')
+    def test_load_views_from_partition_parquet(
+        self, mock_logger, mock_replace_empty, mock_validate, mock_replace_keys
+    ):
+        """Test loading parquet file from partition."""
+        mock_s3_client = MagicMock()
+        mock_spark = MagicMock(spec=SparkSession)
+        mock_reader = MagicMock()
+        mock_spark.read.format.return_value = mock_reader
+        mock_reader.load.return_value = MagicMock(spec=DataFrame)
+
+        mock_replace_keys.return_value = "s3://bucket"
+        mock_replace_empty.return_value = MagicMock(spec=DataFrame)
+
+        file_config = [
+            {
+                "view_name": "sales",
+                "format": "parquet",
+                "path": "/data/sales",
+                "date_partition_key": "REPORT_DATE",
+                "empty_check": False
+            }
+        ]
+
+        etl_util.load_views_from_partition(
+            mock_s3_client,
+            mock_spark,
+            "s3://bucket",
+            file_config,
+            "2025-12-03",
+            upper_col_name=True
+        )
+
+        mock_spark.read.format.assert_called_with("parquet")
+        mock_logger.info.assert_called()
+
+    @patch('etls.reports.etl_util.replace_bucket_keys')
+    @patch('etls.reports.etl_util.validate')
+    @patch('etls.reports.etl_util.replace_empty_with_NULL_string')
+    @patch('etls.reports.etl_util.logger')
+    def test_load_views_from_partition_csv(
+        self, mock_logger, mock_replace_empty, mock_validate, mock_replace_keys
+    ):
+        """Test loading CSV file from partition."""
+        mock_s3_client = MagicMock()
+        mock_spark = MagicMock(spec=SparkSession)
+        mock_reader = MagicMock()
+        mock_spark.read.format.return_value = mock_reader
+        mock_reader.option.return_value = mock_reader
+        mock_reader.load.return_value = MagicMock(spec=DataFrame)
+
+        mock_replace_keys.return_value = "s3://bucket"
+        mock_replace_empty.return_value = MagicMock(spec=DataFrame)
+
+        file_config = [
+            {
+                "view_name": "inventory",
+                "format": "csv",
+                "path": "/data/inventory",
+                "empty_check": False
+            }
+        ]
+
+        etl_util.load_views_from_partition(
+            mock_s3_client,
+            mock_spark,
+            "s3://bucket",
+            file_config,
+            "2025-12-03",
+            upper_col_name=False
+        )
+
+        mock_spark.read.format.assert_called_with("csv")
+
+    @patch('etls.reports.etl_util.replace_bucket_keys')
+    @patch('etls.reports.etl_util.logger')
+    def test_load_views_from_partition_unsupported_format(
+        self, mock_logger, mock_replace_keys
+    ):
+        """Test with unsupported file format."""
+        mock_s3_client = MagicMock()
+        mock_spark = MagicMock(spec=SparkSession)
+        mock_replace_keys.return_value = "s3://bucket"
+
+        file_config = [
+            {
+                "view_name": "data",
+                "format": "json",
+                "path": "/data/json",
+                "empty_check": False
+            }
+        ]
+
+        with self.assertRaises(ValueError):
+            etl_util.load_views_from_partition(
+                mock_s3_client,
+                mock_spark,
+                "s3://bucket",
+                file_config,
+                "2025-12-03"
+            )
+
+        mock_logger.error.assert_called()
+
+
+class TestExecuteSQL(unittest.TestCase):
+    """Test execute_sql function."""
+
+    @patch('etls.reports.etl_util.logger')
+    def test_execute_sql_success(self, mock_logger):
+        """Test successful SQL execution."""
+        mock_spark = MagicMock(spec=SparkSession)
+        mock_df = MagicMock(spec=DataFrame)
+        mock_spark.sql.return_value = mock_df
+
+        etl_util.execute_sql(
+            mock_spark,
+            "result_view",
+            "SELECT * FROM source_view WHERE id > 10"
+        )
+
+        mock_spark.sql.assert_called_once_with(
+            "SELECT * FROM source_view WHERE id > 10"
+        )
+        mock_df.createOrReplaceTempView.assert_called_with("result_view")
+        mock_logger.info.assert_called()
+
+    @patch('etls.reports.etl_util.logger')
+    def test_execute_sql_empty_query(self, mock_logger):
+        """Test with empty query."""
+        mock_spark = MagicMock(spec=SparkSession)
+        mock_df = MagicMock(spec=DataFrame)
+        mock_spark.sql.return_value = mock_df
+
+        etl_util.execute_sql(mock_spark, "view", "")
+
+        mock_spark.sql.assert_called_once_with("")
+
+
+class TestProcessSteps(unittest.TestCase):
+    """Test process_steps orchestration function."""
+
+    @patch('etls.reports.etl_util.load_views_from_partition')
+    @patch('etls.reports.etl_util.logger')
+    def test_process_steps_load_views(self, mock_logger, mock_load_views):
+        """Test process_steps with load_views action."""
+        mock_s3_client = MagicMock()
+        mock_spark = MagicMock(spec=SparkSession)
+        mssql_config = {
+            "connection_url": "jdbc:sqlserver://host",
+            "username": "user",
+            "password": "pwd",
+            "database": "db"
+        }
+
+        config = {
+            "steps": [
+                {
+                    "function": "load_views",
+                    "s3_base_path": "s3://bucket",
+                    "files": []
+                }
+            ]
+        }
+
+        etl_util.process_steps(
+            mock_s3_client,
+            mock_spark,
+            "2025-12-03",
+            config,
+            mssql_config,
+            querys={},
+            functions={}
+        )
+
+        mock_load_views.assert_called_once()
+
+    @patch('etls.reports.etl_util.load_mssql_table_as_spark_temp_table')
+    @patch('etls.reports.etl_util.logger')
+    def test_process_steps_load_table_default(
+        self, mock_logger, mock_load_table
+    ):
+        """Test process_steps with load_table (default native=False)."""
+        mock_s3_client = MagicMock()
+        mock_spark = MagicMock(spec=SparkSession)
+        mssql_config = {
+            "connection_url": "jdbc:sqlserver://host",
+            "username": "user",
+            "password": "pwd",
+            "database": "db"
+        }
+
+        config = {
+            "steps": [
+                {
+                    "function": "load_table",
+                    "table": "source_table",
+                    "temp_table": "temp_view"
+                }
+            ]
+        }
+
+        etl_util.process_steps(
+            mock_s3_client,
+            mock_spark,
+            "2025-12-03",
+            config,
+            mssql_config,
+            querys={},
+            functions={},
+            use_native_table_loads=False
+        )
+
+        mock_load_table.assert_called_once()
+
+    @patch('etls.reports.etl_util.load_mssql_table_as_spark_temp_table_native')
+    @patch('etls.reports.etl_util.logger')
+    def test_process_steps_load_table_native(
+        self, mock_logger, mock_load_table_native
+    ):
+        """Test process_steps with load_table (native=True)."""
+        mock_s3_client = MagicMock()
+        mock_spark = MagicMock(spec=SparkSession)
+        mssql_config = {
+            "connection_url": "jdbc:sqlserver://host",
+            "username": "user",
+            "password": "pwd",
+            "database": "db"
+        }
+
+        config = {
+            "steps": [
+                {
+                    "function": "load_table",
+                    "table": "source_table",
+                    "temp_table": "temp_view"
+                }
+            ]
+        }
+
+        etl_util.process_steps(
+            mock_s3_client,
+            mock_spark,
+            "2025-12-03",
+            config,
+            mssql_config,
+            querys={},
+            functions={},
+            use_native_table_loads=True
+        )
+
+        mock_load_table_native.assert_called_once()
+
+    @patch('etls.reports.etl_util.execute_sql')
+    @patch('etls.reports.etl_util.logger')
+    def test_process_steps_execute_sql(self, mock_logger, mock_execute_sql):
+        """Test process_steps with execute_sql action."""
+        mock_s3_client = MagicMock()
+        mock_spark = MagicMock(spec=SparkSession)
+        mssql_config = {
+            "connection_url": "jdbc:sqlserver://host",
+            "username": "user",
+            "password": "pwd",
+            "database": "db"
+        }
+
+        config = {
+            "steps": [
+                {
+                    "function": "execute_sql",
+                    "view_name": "result",
+                    "sql": "SELECT * FROM temp_view"
+                }
+            ]
+        }
+
+        etl_util.process_steps(
+            mock_s3_client,
+            mock_spark,
+            "2025-12-03",
+            config,
+            mssql_config,
+            querys={},
+            functions={}
+        )
+
+        mock_execute_sql.assert_called_once()
+
+    @patch('etls.reports.etl_util.execute_sql')
+    @patch('etls.reports.etl_util.logger')
+    def test_process_steps_execute_sql_by_name(
+        self, mock_logger, mock_execute_sql
+    ):
+        """Test process_steps with execute_sql_by_name action."""
+        mock_s3_client = MagicMock()
+        mock_spark = MagicMock(spec=SparkSession)
+        mssql_config = {
+            "connection_url": "jdbc:sqlserver://host",
+            "username": "user",
+            "password": "pwd",
+            "database": "db"
+        }
+
+        querys = {
+            "result": "SELECT * FROM temp_view WHERE col > 100"
+        }
+
+        config = {
+            "steps": [
+                {
+                    "function": "execute_sql_by_name",
+                    "view_name": "result"
+                }
+            ]
+        }
+
+        etl_util.process_steps(
+            mock_s3_client,
+            mock_spark,
+            "2025-12-03",
+            config,
+            mssql_config,
+            querys=querys,
+            functions={}
+        )
+
+        mock_execute_sql.assert_called_once()
+        args, _ = mock_execute_sql.call_args
+        self.assertEqual(args[2], querys["result"])
+
+    @patch('etls.reports.etl_util.logger')
+    def test_process_steps_execute_pyspark_function(self, mock_logger):
+        """Test process_steps with execute_pyspark_function_by_name action."""
+        mock_s3_client = MagicMock()
+        mock_spark = MagicMock(spec=SparkSession)
+        mock_func = MagicMock()
+
+        mssql_config = {
+            "connection_url": "jdbc:sqlserver://host",
+            "username": "user",
+            "password": "pwd",
+            "database": "db"
+        }
+
+        functions = {
+            "transform_data": mock_func
+        }
+
+        config = {
+            "steps": [
+                {
+                    "function": "execute_pyspark_function_by_name",
+                    "function_name": "transform_data",
+                    "function_input_view_name": "input_view",
+                    "function_output_view_name": "output_view"
+                }
+            ]
+        }
+
+        etl_util.process_steps(
+            mock_s3_client,
+            mock_spark,
+            "2025-12-03",
+            config,
+            mssql_config,
+            querys={},
+            functions=functions
+        )
+
+        mock_func.assert_called_once_with(
+            mock_spark,
+            "input_view",
+            "output_view",
+            "2025-12-03"
+        )
+
+
+
+    @patch('etls.reports.etl_util.write_view_to_mssql')
+    @patch('etls.reports.etl_util.logger')
+    def test_process_steps_write_view_to_mssql(
+        self, mock_logger, mock_write_view
+    ):
+        """Test process_steps with write_view_to_mssql action."""
+        mock_s3_client = MagicMock()
+        mock_spark = MagicMock(spec=SparkSession)
+        mssql_config = {
+            "connection_url": "jdbc:sqlserver://host",
+            "username": "user",
+            "password": "pwd",
+            "database": "db"
+        }
+
+        config = {
+            "steps": [
+                {
+                    "function": "write_view_to_mssql",
+                    "view": "result_view",
+                    "table_config": {
+                        "table_name": "output_table",
+                        "batch_size": 2000
+                    }
+                }
+            ]
+        }
+
+        etl_util.process_steps(
+            mock_s3_client,
+            mock_spark,
+            "2025-12-03",
+            config,
+            mssql_config,
+            querys={},
+            functions={}
+        )
+
+        mock_write_view.assert_called_once()
+
+    @patch('etls.reports.etl_util.logger')
+    def test_process_steps_empty_steps(self, mock_logger):
+        """Test process_steps with empty steps list."""
+        mock_s3_client = MagicMock()
+        mock_spark = MagicMock(spec=SparkSession)
+        mssql_config = {
+            "connection_url": "jdbc:sqlserver://host",
+            "username": "user",
+            "password": "pwd",
+            "database": "db"
+        }
+
+        config = {"steps": []}
+
+        # Should complete without error
+        etl_util.process_steps(
+            mock_s3_client,
+            mock_spark,
+            "2025-12-03",
+            config,
+            mssql_config,
+            querys={},
+            functions={}
+        )
+
+    @patch('etls.reports.etl_util.logger')
+    def test_process_steps_missing_steps_key(self, mock_logger):
+        """Test process_steps with missing 'steps' key."""
+        mock_s3_client = MagicMock()
+        mock_spark = MagicMock(spec=SparkSession)
+        mssql_config = {
+            "connection_url": "jdbc:sqlserver://host",
+            "username": "user",
+            "password": "pwd",
+            "database": "db"
+        }
+
+        config = {}
+
+        # Should handle gracefully
+        etl_util.process_steps(
+            mock_s3_client,
+            mock_spark,
+            "2025-12-03",
+            config,
+            mssql_config,
+            querys={},
+            functions={}
+        )
+
+    @patch('etls.reports.etl_util.load_views_from_partition')
+    @patch('etls.reports.etl_util.logger')
+    def test_process_steps_exception_handling(
+        self, mock_logger, mock_load_views
+    ):
+        """Test exception handling in process_steps."""
+        mock_s3_client = MagicMock()
+        mock_spark = MagicMock(spec=SparkSession)
+        mock_load_views.side_effect = Exception("Load failed")
+
+        mssql_config = {
+            "connection_url": "jdbc:sqlserver://host",
+            "username": "user",
+            "password": "pwd",
+            "database": "db"
+        }
+
+        config = {
+            "steps": [
+                {
+                    "function": "load_views",
+                    "s3_base_path": "s3://bucket",
+                    "files": []
+                }
+            ]
+        }
+
+        with self.assertRaises(Exception):
+            etl_util.process_steps(
+                mock_s3_client,
+                mock_spark,
+                "2025-12-03",
+                config,
+                mssql_config,
+                querys={},
+                functions={}
+            )
+
+        mock_logger.error.assert_called()
+
+
+class TestGetConfigRoot(unittest.TestCase):
+    """Test get_config_root function."""
+
+    def test_get_config_root_not_implemented(self):
+        """Test that get_config_root raises NotImplementedError."""
+        with self.assertRaises(NotImplementedError):
+            etl_util.get_config_root("/path/to/vault.properties")
+
+
+class TestGetSparkSessionV2(unittest.TestCase):
+    """Test get_spark_session_v2 function."""
+
+    def test_get_spark_session_v2_not_implemented(self):
+        """Test that get_spark_session_v2 raises NotImplementedError."""
+        with self.assertRaises(NotImplementedError):
+            etl_util.get_spark_session_v2(
+                "test_app",
+                "local",
+                "2g",
+                "2g",
+                2,
+                2,
+                4
+            )
+
+
+class TestProcessConfigs(unittest.TestCase):
+    """Test process_configs function."""
+
+    @patch('etls.reports.etl_util.get_spark_session_v2')
+    @patch('etls.reports.etl_util.get_config_root')
+    @patch('etls.reports.etl_util.boto3.client')
+    @patch('etls.reports.etl_util.logger')
+    def test_process_configs_success(
+        self, mock_logger, mock_boto3_client, mock_config, mock_spark_session
+    ):
+        """Test successful process_configs execution."""
+        mock_config.return_value = {
+            "root": {
+                "MASTER_URL": "spark://master:7077",
+                "SPARK_L2_DRIVER_MEMORY": "4g",
+                "SPARK_L2_EXECUTOR_MEMORY": "4g",
+                "SPARK_ML_D_I_CORES": 2,
+                "SPARK_ML_E_I_CORES": 2,
+                "MAX_NUMBER_OF_EXECUTORS": 4,
+                "AWS_ACCESS_KEY_ID": "key",
+                "AWS_SECRET_ACCESS_KEY": "secret",
+                "END_POINT": "http://localhost:9000",
+                "mssql_connection_url": "jdbc:sqlserver://host",
+                "mssql_username": "user",
+                "mssql_pwd": "pwd",
+                "mssql_db": "testdb"
+            }
+        }
+
+        mock_spark = MagicMock(spec=SparkSession)
+        mock_spark_session.return_value = mock_spark
+        mock_s3 = MagicMock()
+        mock_boto3_client.return_value = mock_s3
+
+        spark, mssql_config, yaml_path, s3_client = etl_util.process_configs(
+            "test_job",
+            "dev",
+            "/path/to/config.yaml",
+            "2025-12-03"
+        )
+
+        self.assertEqual(spark, mock_spark)
+        self.assertIn("connection_url", mssql_config)
+        self.assertEqual(mssql_config["username"], "user")
+        self.assertEqual(s3_client, mock_s3)
+        mock_logger.info.assert_called()
+
+    @patch('etls.reports.etl_util.get_config_root')
+    def test_process_configs_vault_file_path(self, mock_config):
+        """Test that process_configs uses correct vault file path."""
+        mock_config.return_value = {
+            "root": {
+                "MASTER_URL": "spark://master:7077",
+                "SPARK_L2_DRIVER_MEMORY": "4g",
+                "SPARK_L2_EXECUTOR_MEMORY": "4g",
+                "SPARK_ML_D_I_CORES": 2,
+                "SPARK_ML_E_I_CORES": 2,
+                "MAX_NUMBER_OF_EXECUTORS": 4,
+                "AWS_ACCESS_KEY_ID": "key",
+                "AWS_SECRET_ACCESS_KEY": "secret",
+                "END_POINT": "http://localhost:9000",
+                "mssql_connection_url": "jdbc:sqlserver://host",
+                "mssql_username": "user",
+                "mssql_pwd": "pwd",
+                "mssql_db": "testdb"
+            }
+        }
+
+        with patch('etls.reports.etl_util.get_spark_session_v2'):
+            with patch('etls.reports.etl_util.boto3.client'):
+                try:
+                    etl_util.process_configs(
+                        "test_job",
+                        "dev",
+                        "/path/to/config.yaml",
+                        "2025-12-03"
+                    )
+                except Exception:
+                    pass
+
+        mock_config.assert_called_with("/rbc_vault/secrets/reports_activity_pr1.properties")
+
+
+class TestTypeAliases(unittest.TestCase):
+    """Test type aliases and constants."""
+
+    def test_query_dict_type(self):
+        """Test QueryDict type alias."""
+        query_dict: etl_util.QueryDict = {
+            "query1": "SELECT * FROM table1",
+            "query2": "SELECT * FROM table2"
+        }
+        self.assertEqual(len(query_dict), 2)
+        self.assertIn("query1", query_dict)
+
+    def test_func_dict_type(self):
+        """Test FuncDict type alias."""
+        def dummy_func(*args, **kwargs):
+            pass
+
+        func_dict: etl_util.FuncDict = {
+            "func1": dummy_func
+        }
+        self.assertIn("func1", func_dict)
+        self.assertEqual(func_dict["func1"], dummy_func)
+
+
+class TestProcessConfigTypeDict(unittest.TestCase):
+    """Test ProcessConfig TypedDict."""
+
+    def test_process_config_with_steps(self):
+        """Test ProcessConfig with steps."""
+        config: etl_util.ProcessConfig = {
+            "steps": [
+                {"function": "load_views", "s3_base_path": "s3://bucket"}
+            ]
+        }
+        self.assertIn("steps", config)
+        self.assertEqual(len(config["steps"]), 1)
+
+    def test_process_config_empty(self):
+        """Test ProcessConfig empty."""
+        config: etl_util.ProcessConfig = {}
+        self.assertNotIn("steps", config)
+
+
+
+
+
+if __name__ == "__main__":
+    unittest.main()
+

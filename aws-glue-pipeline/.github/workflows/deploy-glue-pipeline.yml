@@ -1,0 +1,151 @@
+name: Deploy AWS Glue ETL Pipeline
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'aws-glue-pipeline/**'
+      - '.github/workflows/deploy-glue-pipeline.yml'
+  pull_request:
+    branches: [main, master]
+    paths:
+      - 'aws-glue-pipeline/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  PYTHON_VERSION: '3.12'
+  AWS_REGION: us-east-1
+
+jobs:
+  validate:
+    name: Validate Templates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install cfn-lint
+        run: pip install cfn-lint
+
+      - name: Lint CloudFormation
+        run: cfn-lint aws-glue-pipeline/cloudformation/*.yaml
+
+      - name: Validate Lambda syntax
+        run: python -m py_compile aws-glue-pipeline/lambda/glue_trigger.py
+
+      - name: Validate Glue job syntax
+        run: python -m py_compile aws-glue-pipeline/glue-jobs/csv_etl_job.py
+
+  package:
+    name: Package and Upload
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Package Lambda
+        run: |
+          cd aws-glue-pipeline/lambda
+          pip install -r requirements.txt -t ./package
+          cp glue_trigger.py ./package/
+          cd package
+          zip -r9 ../glue-trigger-${{ github.event.inputs.environment || 'dev' }}.zip .
+          cd ..
+          rm -rf package
+          aws s3 cp glue-trigger-${{ github.event.inputs.environment || 'dev' }}.zip \
+            s3://${{ secrets.LAMBDA_ARTIFACTS_BUCKET }}/lambda/glue-trigger-${{ github.event.inputs.environment || 'dev' }}.zip
+
+      - name: Upload Glue Job Script
+        run: |
+          aws s3 cp aws-glue-pipeline/glue-jobs/csv_etl_job.py \
+            s3://${{ secrets.GLUE_ARTIFACTS_BUCKET }}/glue-jobs/csv_etl_job.py
+
+      - name: Upload CloudFormation Templates
+        run: |
+          aws s3 cp aws-glue-pipeline/cloudformation/main-stack.yaml \
+            s3://${{ secrets.CFN_TEMPLATES_BUCKET }}/glue-pipeline/main-stack.yaml
+
+  deploy:
+    name: Deploy CloudFormation Stack
+    needs: package
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy CloudFormation Stack
+        run: |
+          ENV_NAME="${{ github.event.inputs.environment || 'dev' }}"
+          STACK_NAME="glue-etl-pipeline-${ENV_NAME}"
+
+          aws cloudformation deploy \
+            --template-file aws-glue-pipeline/cloudformation/main-stack.yaml \
+            --stack-name "${STACK_NAME}" \
+            --capabilities CAPABILITY_NAMED_IAM CAPABILITY_IAM \
+            --parameter-overrides \
+              EnvironmentName="${ENV_NAME}" \
+              LambdaS3Bucket="${{ secrets.LAMBDA_ARTIFACTS_BUCKET }}" \
+              GlueArtifactsBucket="${{ secrets.GLUE_ARTIFACTS_BUCKET }}" \
+              DataBucketName="${{ secrets.DATA_BUCKET_NAME }}" \
+              ProcessedBucketName="${{ secrets.PROCESSED_BUCKET_NAME }}" \
+              GithubRepoOwner="${{ github.repository_owner }}" \
+              GithubRepoName="${{ github.event.repository.name }}" \
+              GlueWorkerType="G.1X" \
+              GlueWorkerCount="2" \
+              GlueJobTimeout="60" \
+              LambdaMemorySize="256" \
+              LambdaTimeout="120" \
+              LogRetentionDays="30" \
+              SqsVisibilityTimeout="300" \
+            --tags \
+              Environment="${ENV_NAME}" \
+              Project="Glue-ETL-Pipeline" \
+              ManagedBy="GitHubActions"
+
+      - name: Get Stack Outputs
+        run: |
+          ENV_NAME="${{ github.event.inputs.environment || 'dev' }}"
+          STACK_NAME="glue-etl-pipeline-${ENV_NAME}"
+          aws cloudformation describe-stacks \
+            --stack-name "${STACK_NAME}" \
+            --query "Stacks[0].Outputs" \
+            --output table

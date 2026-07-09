@@ -1,0 +1,324 @@
+from . import etl_util  # the module above
+import unittest
+from unittest.mock import MagicMock, patch
+import types
+
+
+
+
+class DummyDF:
+    def __init__(self, columns):
+        self.columns = columns
+        self.view_name = None
+
+    def withColumn(self, *args, **kwargs):
+        return self
+
+    def toDF(self, *cols):
+        self.columns = list(cols)
+        return self
+
+    def createOrReplaceTempView(self, name):
+        self.view_name = name
+
+    def printSchema(self):
+        pass
+
+    def show(self, *args, **kwargs):
+        pass
+
+
+class DummyTable:
+    def __init__(self, name):
+        self.name = name
+
+
+class ProcessStepsTests(unittest.TestCase):
+    def setUp(self):
+        self.spark = MagicMock()
+        self.s3_client = MagicMock()
+        self.mssql_config = {
+            "connection_url": "jdbc:sqlserver://host:1433",
+            "username": "user",
+            "password": "pwd",
+            "database": "db",
+        }
+
+    @patch("etl_util.load_views_from_partition")
+    def test_process_steps_load_views(self, mock_load):
+        config = {
+            "steps": [
+                {
+                    "function": "load_views",
+                    "s3_base_path": "s3://bucket",
+                    "files": [
+                        {
+                            "view_name": "v1",
+                            "format": "parquet",
+                            "path": "/data",
+                            "date_partition_key": "REPORT_DATE",
+                        }
+                    ],
+                }
+            ]
+        }
+        etl_util.process_steps(
+            self.s3_client,
+            self.spark,
+            "2025-12-01",
+            config,
+            self.mssql_config,
+            querys={},
+            functions={},
+        )
+        mock_load.assert_called_once()
+        args, _ = mock_load.call_args
+        self.assertEqual(args[2], "s3://bucket")
+
+    @patch("etl_util.load_mssql_table_as_spark_temp_table")
+    def test_process_steps_load_table_default(self, mock_load_table):
+        config = {
+            "steps": [
+                {
+                    "function": "load_table",
+                    "table": "TBL",
+                    "temp_table": "TEMP",
+                }
+            ]
+        }
+        etl_util.process_steps(
+            self.s3_client,
+            self.spark,
+            "2025-12-01",
+            config,
+            self.mssql_config,
+            querys={},
+            functions={},
+            use_native_table_loads=False,
+        )
+        mock_load_table.assert_called_once_with(
+            self.spark, self.mssql_config, "TBL", "2025-12-01", "TEMP"
+        )
+
+    @patch("etl_util.load_mssql_table_as_spark_temp_table_native")
+    def test_process_steps_load_table_native(self, mock_load_table_native):
+        config = {
+            "steps": [
+                {
+                    "function": "load_table",
+                    "table": "TBL",
+                    "temp_table": "TEMP",
+                }
+            ]
+        }
+        etl_util.process_steps(
+            self.s3_client,
+            self.spark,
+            "2025-12-01",
+            config,
+            self.mssql_config,
+            querys={},
+            functions={},
+            use_native_table_loads=True,
+        )
+        mock_load_table_native.assert_called_once_with(
+            self.spark, self.mssql_config, "TBL", "2025-12-01", "TEMP"
+        )
+
+    @patch("etl_util.execute_sql")
+    def test_process_steps_execute_sql_by_name(self, mock_exec_sql):
+        config = {
+            "steps": [
+                {
+                    "function": "execute_sql_by_name",
+                    "view_name": "V1",
+                }
+            ]
+        }
+        queries = {"V1": "SELECT 1"}
+        etl_util.process_steps(
+            self.s3_client,
+            self.spark,
+            "2025-12-01",
+            config,
+            self.mssql_config,
+            querys=queries,
+            functions={},
+        )
+        mock_exec_sql.assert_called_once_with(self.spark, "V1", "SELECT 1")
+
+    def test_process_steps_execute_pyspark_function_by_name(self):
+        called = {}
+
+        def dummy_func(spark, in_view, out_view, report_date):
+            called["args"] = (spark, in_view, out_view, report_date)
+
+        config = {
+            "steps": [
+                {
+                    "function": "execute_pyspark_function_by_name",
+                    "function_name": "dummy",
+                    "function_input_view_name": "IN",
+                    "function_output_view_name": "OUT",
+                }
+            ]
+        }
+        etl_util.process_steps(
+            self.s3_client,
+            self.spark,
+            "2025-12-01",
+            config,
+            self.mssql_config,
+            querys={},
+            functions={"dummy": dummy_func},
+        )
+        self.assertEqual(
+            called["args"], (self.spark, "IN", "OUT", "2025-12-01")
+        )
+
+    @patch("etl_util.write_view_to_mssql")
+    def test_process_steps_write_view_to_mssql(self, mock_write):
+        config = {
+            "steps": [
+                {
+                    "function": "write_view_to_mssql",
+                    "view": "V1",
+                    "table_config": {"table_name": "T1"},
+                }
+            ]
+        }
+        etl_util.process_steps(
+            self.s3_client,
+            self.spark,
+            "2025-12-01",
+            config,
+            self.mssql_config,
+            querys={},
+            functions={},
+        )
+        mock_write.assert_called_once()
+
+
+class WriteViewToMSSQLTests(unittest.TestCase):
+    def setUp(self):
+        self.spark = MagicMock()
+        # catalog.listTables returns a list containing our view
+        catalog = types.SimpleNamespace(listTables=lambda: [DummyTable("V1")])
+        self.spark.catalog = catalog
+        self.df = DummyDF(["REPORT_DATE", "COL1"])
+        self.spark.table.return_value = self.df
+        self.mssql_config = {
+            "connection_url": "jdbc:sqlserver://host:1433",
+            "username": "user",
+            "password": "pwd",
+            "database": "db",
+        }
+
+    @patch("etl_util.write_df_to_scon")
+    @patch("etl_util.execute_scon_query")
+    @patch("etl_util.generate_sql_server_ddl")
+    def test_write_view_to_mssql_happy_path(
+        self, mock_ddl, mock_exec_query, mock_write_df
+    ):
+        mock_ddl.return_value = "CREATE TABLE T1 (...)"
+        table_config = {"table_name": "T1", "batch_size": 500}
+
+        etl_util.write_view_to_mssql(
+            self.spark, "V1", self.mssql_config, table_config, "2025-12-01"
+        )
+
+        expected_query = "DELETE FROM T1 WHERE REPORT_DATE = '2025-12-01'"
+        mock_exec_query.assert_called_once()
+        args, _ = mock_exec_query.call_args
+        self.assertEqual(args[-1], expected_query)
+
+        mock_write_df.assert_called_once()
+        args, _ = mock_write_df.call_args
+        self.assertEqual(args[4], "T1")  # table_name argument
+
+    def test_write_view_to_mssql_invalid_view(self):
+        # make catalog return a different view name
+        self.spark.catalog = types.SimpleNamespace(
+            listTables=lambda: [DummyTable("OTHER")]
+        )
+        with self.assertRaises(ValueError):
+            etl_util.write_view_to_mssql(
+                self.spark,
+                "V1",
+                self.mssql_config,
+                {"table_name": "T1"},
+                "2025-12-01",
+            )
+
+
+class LoadMSSQLTableTests(unittest.TestCase):
+    def setUp(self):
+        self.spark = MagicMock()
+        self.mssql_config = {
+            "connection_url": "jdbc:sqlserver://host:1433",
+            "username": "user",
+            "password": "pwd",
+            "database": "db",
+        }
+
+    @patch("etl_util.load_mssql_view_as_df")
+    def test_load_mssql_table_as_spark_temp_table(self, mock_view_as_df):
+        df = DummyDF(["COL1"])
+        mock_view_as_df.return_value = df
+
+        etl_util.load_mssql_table_as_spark_temp_table(
+            self.spark,
+            self.mssql_config,
+            "TBL",
+            "2025-12-01",
+            "TEMP",
+        )
+
+        mock_view_as_df.assert_called_once()
+        self.assertEqual(df.view_name, "TEMP")
+
+
+class ProcessConfigsTests(unittest.TestCase):
+    @patch("etl_util.boto3.client")
+    @patch("etl_util.get_spark_session_v2")
+    @patch("etl_util.get_config_root")
+    def test_process_configs_returns_objects(
+        self, mock_get_config_root, mock_get_spark, mock_boto_client
+    ):
+        mock_get_config_root.return_value = {
+            "root": {
+                "MASTER_URL": "local",
+                "SPARK_L2_DRIVER_MEMORY": "1g",
+                "SPARK_L2_EXECUTOR_MEMORY": "1g",
+                "SPARK_ML_D_I_CORES": 1,
+                "SPARK_ML_E_I_CORES": 1,
+                "MAX_NUMBER_OF_EXECUTORS": 1,
+                "AWS_ACCESS_KEY_ID": "k",
+                "AWS_SECRET_ACCESS_KEY": "s",
+                "END_POINT": "http://localhost",
+                "mssql_connection_url": "jdbc:sqlserver://host:1433",
+                "mssql_username": "user",
+                "mssql_pwd": "pwd",
+                "mssql_db": "db",
+            }
+        }
+        mock_spark = MagicMock()
+        mock_get_spark.return_value = mock_spark
+        mock_s3_client = MagicMock()
+        mock_boto_client.return_value = mock_s3_client
+
+        spark, mssql_config, yaml_path, s3_client = etl_util.process_configs(
+            job_name="job",
+            vault_env="dev",
+            report_yaml_path="/tmp/report.yml",
+            file_date="20251201",
+        )
+
+        self.assertIs(spark, mock_spark)
+        self.assertEqual(mssql_config["database"], "db")
+        self.assertEqual(yaml_path, "/tmp/report.yml")
+        self.assertIs(s3_client, mock_s3_client)
+
+
+if __name__ == "__main__":
+    unittest.main()

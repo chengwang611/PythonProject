@@ -1,0 +1,11 @@
+# Simple pipeline for SalesReportProcessor
+- action: read
+  table: sales
+- action: sql
+  query: "SELECT product, SUM(amount) as total_amount FROM sales GROUP BY product"
+  view: sales_agg
+- action: read
+  table: sales_agg
+- action: write
+  table: sales_agg_table
+
