@@ -138,7 +138,7 @@ Resources:
               S3Key:
                 Rules:
                   - Name: suffix
-                    Value: .csv
+                    Value: _COMPLETE
             Queue: !GetAtt IngestionQueue.Arn
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
@@ -389,6 +389,14 @@ Resources:
                   - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${LakeFormationDatabaseName}'
                   - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${LakeFormationDatabaseName}/*'
                   - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:userDefinedFunction/${LakeFormationDatabaseName}/*'
+              # Allow Glue job to start the crawler after ETL completes
+              - Effect: Allow
+                Action:
+                  - glue:StartCrawler
+                  - glue:GetCrawler
+                  - glue:GetCrawlerMetrics
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:crawler/${EnvironmentName}-processed-data-crawler'
 
   # ============================================================
   # GLUE JOB
@@ -405,6 +413,7 @@ Resources:
         PythonVersion: '3'
       DefaultArguments:
         '--environment': !Ref EnvironmentName
+        '--PROCESSED_BUCKET': !Sub '${ProcessedBucket}-${AWS::AccountId}-${EnvironmentName}'
         '--job-language': 'python'
         '--enable-continuous-cloudwatch-log': 'true'
         '--enable-auto-scaling': 'true'
@@ -462,41 +471,46 @@ Resources:
           managedBy: CloudFormation
           lakeFormationManaged: 'true'
 
-  # Create a table in the Lake Formation database
-  # This table represents the Parquet output written by the Glue job
-  ProcessedDataTable:
-    Type: AWS::Glue::Table
-    DependsOn: ProcessedDataDatabase
+  # Glue Crawler — auto-discovers Parquet schema in the processed bucket
+  # Replaces the static Glue Table. The crawler scans the output/ prefix,
+  # infers the schema from Parquet files, and creates/updates the table
+  # in the Glue Data Catalog. Triggered by the Glue job after ETL completes.
+  ProcessedDataCrawler:
+    Type: AWS::Glue::Crawler
+    DependsOn:
+      - ProcessedDataDatabase
+      - GlueJobRole
     Properties:
-      CatalogId: !Ref AWS::AccountId
+      Name: !Sub '${EnvironmentName}-processed-data-crawler'
+      Description: !Sub 'Auto-discovers Parquet schema from processed ETL output in ${EnvironmentName}'
+      Role: !GetAtt GlueJobRole.Arn
       DatabaseName: !Ref LakeFormationDatabaseName
-      TableInput:
-        Name: !Ref LakeFormationTableName
-        Description: !Sub 'Processed CSV data in Parquet format — governed by Lake Formation'
-        TableType: EXTERNAL_TABLE
-        Parameters:
-          classification: parquet
-          environment: !Ref EnvironmentName
-          lakeFormationManaged: 'true'
-        StorageDescriptor:
-          Location: !Sub 's3://${ProcessedBucket}-${AWS::AccountId}-${EnvironmentName}/output/'
-          InputFormat: 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat'
-          OutputFormat: 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat'
-          SerdeInfo:
-            SerializationLibrary: 'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe'
-            Parameters:
-              serialization.format: '1'
-          Columns:
-            - Name: partition_0
-              Type: string
-            - Name: partition_1
-              Type: string
-          NumberOfBuckets: -1
-          Compressed: true
-          StoredAsSubDirectories: false
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${ProcessedBucket}-${AWS::AccountId}-${EnvironmentName}/output/'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      TablePrefix: !Sub '${EnvironmentName}_'
+      Configuration: |
+        {
+          "Version": 1.0,
+          "CrawlerOutput": {
+            "Tables": {
+              "AddOrUpdateBehavior": "MergeNewColumns"
+            }
+          }
+        }
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Project
+          Value: Glue-ETL-Pipeline
 
   # Grant the Glue job role full access to the Lake Formation database
-  # This allows the Glue job to write data that is governed by Lake Formation
+  # This allows the Glue job AND crawler to create/update tables
+  # governed by Lake Formation. Database-level grants replace the
+  # previous table-level grants since the crawler creates tables dynamically.
   GlueJobLakeFormationDatabaseGrant:
     Type: AWS::LakeFormation::Permissions
     DependsOn:
@@ -513,23 +527,25 @@ Resources:
         - CREATE_TABLE
         - ALTER
         - DROP
+        - DESCRIBE
       PermissionsWithGrantOption:
         - CREATE_TABLE
 
-  # Grant the Glue job role full access to the Lake Formation table
-  GlueJobLakeFormationTableGrant:
+  # Grant the Glue job role access to ALL tables in the database
+  # (replaces the previous single-table grant — crawler creates tables dynamically)
+  GlueJobLakeFormationAllTablesGrant:
     Type: AWS::LakeFormation::Permissions
     DependsOn:
-      - ProcessedDataTable
+      - ProcessedDataDatabase
       - GlueJobRole
     Properties:
       Principal:
         DataLakePrincipalIdentifier: !GetAtt GlueJobRole.Arn
       Resource:
-        TableResource:
+        TableWithColumnsResource:
           CatalogId: !Ref AWS::AccountId
           DatabaseName: !Ref LakeFormationDatabaseName
-          Name: !Ref LakeFormationTableName
+          Name: '*'
       Permissions:
         - SELECT
         - INSERT
@@ -554,21 +570,20 @@ Resources:
         - DATA_LOCATION_ACCESS
 
   # If a data lake principal is specified, grant them SELECT access
-  # This allows external roles (e.g., data analysts) to query the processed data
-  # through Athena or Redshift Spectrum, governed by Lake Formation
-  ExternalPrincipalTableGrant:
+  # to ALL tables in the database (crawler creates tables dynamically)
+  ExternalPrincipalAllTablesGrant:
     Type: AWS::LakeFormation::Permissions
     Condition: HasExternalPrincipal
     DependsOn:
-      - ProcessedDataTable
+      - ProcessedDataDatabase
     Properties:
       Principal:
         DataLakePrincipalIdentifier: !Ref ProcessedDataLakePrincipal
       Resource:
-        TableResource:
+        TableWithColumnsResource:
           CatalogId: !Ref AWS::AccountId
           DatabaseName: !Ref LakeFormationDatabaseName
-          Name: !Ref LakeFormationTableName
+          Name: '*'
       Permissions:
         - SELECT
         - DESCRIBE

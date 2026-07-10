@@ -1,8 +1,17 @@
 # Folder-Level Completion Trigger — Design Document
 
+> **Status: Solution A (Sentinel File) ✅ IMPLEMENTED**
+>
+> The Sentinel File approach has been implemented in the pipeline:
+> - [`cloudformation/main-stack.yaml`](cloudformation/main-stack.yaml) — S3 suffix filter changed to `_COMPLETE`
+> - [`lambda/glue_trigger.py`](lambda/glue_trigger.py) — Folder-level sentinel logic with `_extract_folder_from_sentinel()`, `_list_csv_files_in_folder()`, `_start_glue_job_for_folder()`
+> - [`glue-jobs/csv_etl_job.py`](glue-jobs/csv_etl_job.py) — Multi-file read support with `read_csv_files()` and `unionByName`
+>
+> Solutions B, C, and D remain documented as alternatives for different scenarios.
+
 ## Problem Statement
 
-The current Glue ETL pipeline triggers on **every individual `.csv` file** via S3 event notification → SQS → Lambda. However, many data ingestion workflows require waiting until **all files in a specific folder** have been delivered before starting processing.
+The pipeline now triggers on a **_COMPLETE sentinel file** uploaded after all CSV files in a folder have been delivered. This document describes the design and alternatives considered.
 
 **Example scenarios:**
 - A daily batch where 50 CSV files are uploaded to `s3://bucket/incoming/2026-07-10/`

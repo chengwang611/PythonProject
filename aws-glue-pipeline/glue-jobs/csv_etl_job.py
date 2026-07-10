@@ -31,6 +31,7 @@ Optional arguments:
     --date_column        Column to parse as date
 """
 
+import os
 import sys
 import json
 import logging
@@ -196,6 +197,53 @@ def read_csv(spark: SparkSession, input_path: str, delimiter: str,
     return df
 
 
+def read_csv_files(spark: SparkSession, input_paths_json: str,
+                   delimiter: str, header: bool, infer_schema: bool):
+    """
+    Read multiple CSV files from a JSON array of S3 paths.
+    Unions all files into a single DataFrame using unionByName
+    (handles column order differences between files).
+
+    Used in folder-level sentinel mode where the Lambda passes
+    all CSV file paths in the folder as a JSON array.
+    """
+    paths = json.loads(input_paths_json)
+
+    if not paths:
+        raise ValueError("Empty file list provided to read_csv_files")
+
+    logger.info("Reading %d CSV files in folder mode", len(paths))
+
+    dfs = []
+    for i, path in enumerate(paths):
+        logger.info("  [%d/%d] Reading: %s", i + 1, len(paths), path)
+        df = spark.read \
+            .format('csv') \
+            .option('delimiter', delimiter) \
+            .option('header', str(header).lower()) \
+            .option('inferSchema', str(infer_schema).lower()) \
+            .option('mode', 'PERMISSIVE') \
+            .option('columnNameOfCorruptRecord', '_corrupt_record') \
+            .load(path)
+        dfs.append(df)
+
+    # Union all DataFrames (unionByName handles column order differences)
+    from functools import reduce
+    from pyspark.sql import DataFrame
+
+    if len(dfs) == 1:
+        combined = dfs[0]
+    else:
+        combined = reduce(DataFrame.unionByName, dfs)
+
+    record_count = combined.count()
+    column_count = len(combined.columns)
+    logger.info("Combined %d files: %d records, %d columns",
+                len(paths), record_count, column_count)
+
+    return combined
+
+
 # ---------------------------------------------------------------------------
 # Transformations
 # ---------------------------------------------------------------------------
@@ -317,6 +365,112 @@ def write_output(df, output_path: str, args: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Folder Lock Release
+# ---------------------------------------------------------------------------
+
+def _release_folder_lock(folder_prefix: str, environment: str) -> None:
+    """
+    Release the folder-level distributed lock after successful ETL completion.
+
+    The lock was acquired by the Lambda when the _COMPLETE sentinel was detected.
+    Releasing it here (after Parquet write + manifest + dedup marker) allows the
+    same folder to be re-processed if needed (e.g., data correction, re-ingestion).
+
+    If the Glue job fails, the lock is NOT released — this prevents the SQS
+    retry from triggering a duplicate run. The lock will eventually expire via
+    the S3 lifecycle policy (default: 7 days) or can be manually deleted.
+
+    Lock key format: _locks/{sha256(folder_prefix)}.lock
+    """
+    if not folder_prefix:
+        logger.info("No folder prefix provided — skipping lock release")
+        return
+
+    import hashlib
+    folder_hash = hashlib.sha256(folder_prefix.encode()).hexdigest()
+    lock_key = f"_locks/{folder_hash}.lock"
+
+    # The processed bucket is also used as the lock bucket
+    processed_bucket = os.environ.get('PROCESSED_BUCKET', '')
+
+    if not processed_bucket:
+        logger.warning(
+            "PROCESSED_BUCKET env var not set — cannot release lock for folder '%s'",
+            folder_prefix,
+        )
+        return
+
+    try:
+        import boto3
+        s3_client = boto3.client('s3')
+        s3_client.delete_object(Bucket=processed_bucket, Key=lock_key)
+        logger.info(
+            "Released folder lock: s3://%s/%s (folder: '%s')",
+            processed_bucket, lock_key, folder_prefix,
+        )
+    except Exception as exc:
+        # Lock release failure is non-fatal — data is already written
+        logger.warning(
+            "Failed to release folder lock s3://%s/%s: %s. "
+            "Lock will expire via S3 lifecycle policy.",
+            processed_bucket, lock_key, exc,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Glue Crawler Trigger
+# ---------------------------------------------------------------------------
+
+def _trigger_crawler(environment: str) -> None:
+    """
+    Trigger the Glue Crawler to update the Data Catalog schema after
+    new Parquet data has been written to the processed bucket.
+
+    The crawler scans the processed S3 prefix, infers the schema from
+    the Parquet files, and updates the Glue Catalog table. This ensures
+    Athena, Redshift Spectrum, and EMR always see the latest schema.
+
+    The crawler runs asynchronously — we fire and forget. The crawler
+    typically completes in 1-5 minutes depending on data volume.
+    """
+    crawler_name = f'{environment}-processed-data-crawler'
+
+    try:
+        import boto3
+        glue_client = boto3.client('glue', region_name='us-east-1')
+
+        # Check if crawler is already running
+        crawler_info = glue_client.get_crawler(Name=crawler_name)
+        crawler_state = crawler_info.get('Crawler', {}).get('State', 'UNKNOWN')
+
+        if crawler_state == 'RUNNING':
+            logger.info(
+                "Crawler '%s' is already running — skipping trigger",
+                crawler_name,
+            )
+            return
+
+        glue_client.start_crawler(Name=crawler_name)
+        logger.info(
+            "Triggered Glue Crawler '%s' to update catalog schema",
+            crawler_name,
+        )
+
+    except glue_client.exceptions.CrawlerRunningException:
+        logger.info(
+            "Crawler '%s' is already running — skipping trigger",
+            crawler_name,
+        )
+    except Exception as exc:
+        # Crawler trigger failure is non-fatal — the ETL data is already written
+        logger.warning(
+            "Failed to trigger Glue Crawler '%s': %s. "
+            "Data is written but catalog schema may be stale until next crawl.",
+            crawler_name, exc,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Metrics / Manifest
 # ---------------------------------------------------------------------------
 
@@ -339,24 +493,37 @@ def write_manifest(metrics: dict, output_path: str, spark: SparkSession) -> None
 # ---------------------------------------------------------------------------
 
 def main():
-    """Main ETL job entry point with idempotency support."""
+    """Main ETL job entry point with idempotency support and folder-level processing."""
     args = parse_args()
     job_start = datetime.utcnow()
 
     input_path = get_arg(args, 'input_path', '')
+    input_paths_json = get_arg(args, 'input_paths', '')     # NEW: folder-level multi-file input
     output_path = get_arg(args, 'output_path', '')
     job_id = get_arg(args, 'job_id', 'unknown')
     environment = get_arg(args, 'environment', 'dev')
     file_dedup_key = get_arg(args, 'file_dedup_key', '')
+    folder_prefix = get_arg(args, 'folder_prefix', '')      # NEW: folder prefix for logging
     transform_type = get_arg(args, 'transform', 'clean')
     delimiter = get_arg(args, 'delimiter', ',')
     header = get_arg(args, 'header', 'true')
     infer_schema = get_arg(args, 'infer_schema', 'true')
 
+    # Determine processing mode
+    is_folder_mode = bool(input_paths_json)
+    input_desc = (
+        f"folder '{folder_prefix}' ({len(json.loads(input_paths_json))} files)"
+        if is_folder_mode and folder_prefix
+        else f"folder ({len(json.loads(input_paths_json))} files)"
+        if is_folder_mode
+        else input_path
+    )
+
     logger.info("=" * 60)
     logger.info("Starting Glue ETL Job: %s", job_id)
     logger.info("Environment: %s", environment)
-    logger.info("Input: %s", input_path)
+    logger.info("Mode: %s", 'FOLDER' if is_folder_mode else 'SINGLE FILE')
+    logger.info("Input: %s", input_desc)
     logger.info("Output: %s", output_path)
     logger.info("Transform: %s", transform_type)
     logger.info("File Dedup Key: %s", file_dedup_key or '(not provided)')
@@ -369,12 +536,12 @@ def main():
         # IDEMPOTENCY CHECK
         # ================================================================
         if _is_already_processed(spark, output_path, file_dedup_key):
-            logger.info("IDEMPOTENCY: File %s already processed. Exiting successfully.", input_path)
+            logger.info("IDEMPOTENCY: %s already processed. Exiting successfully.", input_desc)
             job_end = datetime.utcnow()
             metrics = {
                 'job_id': job_id,
                 'environment': environment,
-                'input_path': input_path,
+                'input_path': input_desc,
                 'output_path': output_path,
                 'transform': transform_type,
                 'input_record_count': 0,
@@ -384,19 +551,29 @@ def main():
                 'duration_seconds': (job_end - job_start).total_seconds(),
                 'status': 'SKIPPED_DUPLICATE',
                 'dedup_key': file_dedup_key,
+                'mode': 'folder' if is_folder_mode else 'single',
             }
             write_manifest(metrics, output_path, spark)
             spark.stop()
             return
 
-        # Step 1: Read CSV
-        df = read_csv(
-            spark=spark,
-            input_path=input_path,
-            delimiter=delimiter,
-            header=header.lower() == 'true',
-            infer_schema=infer_schema.lower() == 'true',
-        )
+        # Step 1: Read CSV (single file or folder of files)
+        if is_folder_mode:
+            df = read_csv_files(
+                spark=spark,
+                input_paths_json=input_paths_json,
+                delimiter=delimiter,
+                header=header.lower() == 'true',
+                infer_schema=infer_schema.lower() == 'true',
+            )
+        else:
+            df = read_csv(
+                spark=spark,
+                input_path=input_path,
+                delimiter=delimiter,
+                header=header.lower() == 'true',
+                infer_schema=infer_schema.lower() == 'true',
+            )
         input_record_count = df.count()
 
         # Step 2: Apply transformation
@@ -433,6 +610,12 @@ def main():
 
         write_manifest(metrics, output_path, spark)
         _write_processed_marker(spark, output_path, file_dedup_key)
+
+        # Step 5: Release folder-level lock (allows re-processing if needed)
+        _release_folder_lock(folder_prefix, environment)
+
+        # Step 6: Trigger Glue Crawler to update catalog schema
+        _trigger_crawler(environment)
 
         logger.info("=" * 60)
         logger.info("Job %s completed successfully", job_id)

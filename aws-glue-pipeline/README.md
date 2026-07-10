@@ -1,6 +1,6 @@
-# AWS Glue ETL Pipeline - S3 → SQS → Lambda → Glue (PySpark)
+# AWS Glue ETL Pipeline - Sentinel File → S3 → SQS → Lambda → Glue (PySpark)
 
-A **serverless** event-driven ETL pipeline that automatically processes CSV files dropped into an S3 bucket using **AWS Glue** (instead of EMR). Designed for **exactly-once processing** using S3 conditional put (`IfNoneMatch='*'`) — no DynamoDB needed. Uses **AWS Lake Formation** for fine-grained access control on the processed data.
+A **serverless** event-driven ETL pipeline that processes CSV files by folder using a **_COMPLETE sentinel file** trigger. When all files in a folder are uploaded, the upstream drops a `_COMPLETE` marker — the pipeline then processes all CSV files in that folder as a single batch using **AWS Glue** (serverless Spark). Designed for **exactly-once processing** using S3 conditional put (`IfNoneMatch='*'`) at the folder level — no DynamoDB needed. Uses **AWS Lake Formation** for fine-grained access control and a **Glue Crawler** for automatic schema discovery on the processed data.
 
 ## Why Glue Instead of EMR?
 
@@ -26,26 +26,30 @@ A **serverless** event-driven ETL pipeline that automatically processes CSV file
                                                           │
                                                           │ Governs Access
                                                           ▼
-┌──────────────┐     S3 Event     ┌──────────────┐     SQS Message     ┌──────────────────────┐
-│   S3 Bucket  │ ───────────────► │  SQS Queue   │ ──────────────────► │    Lambda            │
-│  (CSV Drop)  │                  │ (Ingestion)  │                     │  (S3 Conditional Put) │
-└──────────────┘                  └──────┬───────┘                     └──────────┬───────────┘
-                                        │                                        │
-                                        │ DLQ                                    │
-                                   ┌────▼────┐                            ┌──────▼──────┐
-                                   │   DLQ   │                            │  S3 Bucket  │
-                                   │ (Failed)│                            │  (_locks/)  │
-                                   └─────────┘                            └──────┬──────┘
-                                                                                │
-                                                                    ┌───────────▼───────────┐
-                                                                    │  IfNoneMatch='*'      │
-                                                                    │  (Atomic Check-Set)   │
-                                                                    └───────────┬───────────┘
-                                                                                │
-                                                                   ┌────────────▼────────────┐
-                                                                   │  Glue: StartJobRun      │
-                                                                   │  (Serverless Spark)     │
-                                                                   └────────────┬────────────┘
+┌──────────────────┐   S3 Event       ┌──────────────┐   SQS Message    ┌──────────────────────────┐
+│   S3 Bucket      │  (_COMPLETE)     │  SQS Queue   │ ───────────────► │    Lambda                │
+│  ┌────────────┐  │ ───────────────► │ (Ingestion)  │                  │  (Folder-Level Sentinel) │
+│  │ part-01.csv│  │                  │              │                  │                          │
+│  │ part-02.csv│  │                  │ Filter:      │                  │  1. Extract folder       │
+│  │ part-NN.csv│  │                  │ *_COMPLETE   │                  │  2. List .csv files      │
+│  │ _COMPLETE  │  │                  │              │                  │  3. Folder-level lock    │
+│  └────────────┘  │                  └──────┬───────┘                  │  4. Start Glue job       │
+└──────────────────┘                        │                          └──────────┬───────────────┘
+                                            │ DLQ                                 │
+                                       ┌────▼────┐                         ┌──────▼──────┐
+                                       │   DLQ   │                         │  S3 Bucket  │
+                                       │ (Failed)│                         │  (_locks/)  │
+                                       └─────────┘                         └──────┬──────┘
+                                                                                 │
+                                                                     ┌───────────▼───────────┐
+                                                                     │  IfNoneMatch='*'      │
+                                                                     │  (Folder-Level Lock)  │
+                                                                     └───────────┬───────────┘
+                                                                                 │
+                                                                    ┌────────────▼────────────┐
+                                                                    │  Glue: StartJobRun      │
+                                                                    │  (All files in folder)  │
+                                                                    └────────────┬────────────┘
                                                                                 │
                                                                         ┌───────▼────────┐
                                                                         │  S3 Processed   │
@@ -58,10 +62,18 @@ A **serverless** event-driven ETL pipeline that automatically processes CSV file
                                                                    │  │ Database:          │  │
                                                                    │  │ etl_processed_data │  │
                                                                    │  │                    │  │
-                                                                   │  │ Table: csv_output  │  │
-                                                                   │  │ (Parquet, LF-gov)  │  │
+                                                                   │  │ Tables (auto-      │  │
+                                                                   │  │ discovered by      │  │
+                                                                   │  │ Glue Crawler)      │  │
                                                                    │  └────────────────────┘  │
                                                                    └────────────┬────────────┘
+                                                                                │
+                                                                   ┌────────────▼────────────┐
+                                                                   │   Glue Crawler           │
+                                                                   │  (Schema Discovery)      │
+                                                                   │  Triggered by Glue Job   │
+                                                                   │  after ETL completes     │
+                                                                   └──────────────────────────┘
                                                                                 │
                                                           ┌─────────────────────┼─────────────────────┐
                                                           │                     │                     │
@@ -83,26 +95,31 @@ A **serverless** event-driven ETL pipeline that automatically processes CSV file
 
 ### Data Flow
 
-1. **CSV file lands** in the S3 data bucket
-2. **S3 event notification** sends a message to the SQS ingestion queue (filtered for `.csv` suffix)
-3. **Lambda function** (SQS-triggered) reads the message and:
-   - **Exactly-Once Check**: S3 conditional put with `IfNoneMatch='*'` — atomic distributed lock
-     - If lock exists → skip (already processed)
+1. **Upstream uploads all CSV files** to a folder in the S3 data bucket (e.g., `s3://bucket/incoming/2026-07-10/part-01.csv`, `part-02.csv`, ...)
+2. **Upstream uploads `_COMPLETE` sentinel file** as the LAST file in the folder, signaling all data is ready
+3. **S3 event notification** sends a message to the SQS ingestion queue (filtered for `_COMPLETE` suffix)
+4. **Lambda function** ([`glue_trigger.py`](lambda/glue_trigger.py)) is triggered by SQS:
+   - **Extracts folder prefix** from the sentinel path (e.g., `incoming/2026-07-10/_COMPLETE` → `incoming/2026-07-10/`)
+   - **Exactly-Once Check**: S3 conditional put with `IfNoneMatch='*'` — atomic distributed lock at the **folder level**
+     - If lock exists → skip (folder already processed)
      - If lock is new → acquire and proceed
-   - **Starts Glue job** via `glue.start_job_run()` — no cluster to create
-   - On failure → releases the S3 lock so the file can be retried
-4. **Glue job** (serverless Spark) runs the PySpark ETL which:
+   - **Lists all `.csv` files** in the folder via `s3.list_objects_v2()`
+   - Optionally **validates** file count against sentinel metadata
+   - **Starts Glue job** with all file paths as a JSON array
+   - On failure → releases the S3 lock so the folder can be retried
+5. **Glue job** ([`csv_etl_job.py`](glue-jobs/csv_etl_job.py)) runs serverless Spark:
    - **Idempotency Check**: Checks for existing S3 marker before processing
-   - Reads CSV from S3
+   - **Reads all CSV files** from the JSON array, unions them into a single DataFrame
    - Applies transformations (clean, aggregate, or passthrough)
    - Writes Parquet output to processed S3 bucket
    - Writes `_SUCCESS` dedup marker and `_MANIFEST.json`
-5. **SQS message is deleted** after successful processing
-6. **Failed messages** go to a Dead Letter Queue (DLQ)
-7. **Glue Data Catalog** registers the processed Parquet data as a table (`etl_processed_data.csv_output`)
-8. **Lake Formation** governs all access to the catalog table — enforcing column-level, row-level, and cell-level security
-9. **Amazon Athena** (and Redshift Spectrum, EMR) queries the data through Lake Formation, which authorizes every request
-10. **BI tools** (QuickSight, Tableau) connect via Athena JDBC/ODBC to visualize the governed data
+   - **Triggers Glue Crawler** to auto-discover the Parquet schema and update the Data Catalog
+6. **SQS message is deleted** after successful processing
+7. **Failed messages** go to a Dead Letter Queue (DLQ)
+8. **Glue Crawler** scans the processed Parquet files, infers the schema, and creates/updates tables in the Glue Data Catalog
+9. **Lake Formation** governs all access to the catalog tables — enforcing column-level, row-level, and cell-level security
+10. **Amazon Athena** (and Redshift Spectrum, EMR) queries the data through Lake Formation, which authorizes every request
+11. **BI tools** (QuickSight, Tableau) connect via Athena JDBC/ODBC to visualize the governed data
 
 ## Project Structure
 
@@ -264,16 +281,17 @@ The processed S3 bucket is governed by **AWS Lake Formation** for fine-grained a
 
 ### Resources Created
 
-The CloudFormation stack creates these Lake Formation resources:
+The CloudFormation stack creates these Lake Formation and Glue Catalog resources:
 
 | Resource | Type | Description |
 |----------|------|-------------|
 | **Processed S3 Location** | `AWS::LakeFormation::Resource` | Registers the processed bucket as a Lake Formation governed location |
 | **`etl_processed_data`** | `AWS::Glue::Database` | Glue Catalog database pointing to the processed bucket |
-| **`csv_output`** | `AWS::Glue::Table` | Glue Catalog table for Parquet output, governed by Lake Formation |
-| **Glue Job Permissions** | `AWS::LakeFormation::Permissions` | Grants the Glue job role `SELECT`, `INSERT`, `ALTER`, `DROP` on the table |
+| **Glue Crawler** | `AWS::Glue::Crawler` | Auto-discovers Parquet schema and creates/updates tables in the catalog |
+| **Glue Job DB Grant** | `AWS::LakeFormation::Permissions` | Grants `CREATE_TABLE`, `ALTER`, `DROP`, `DESCRIBE` on the database |
+| **Glue Job All-Tables Grant** | `AWS::LakeFormation::Permissions` | Grants `SELECT`, `INSERT`, `ALTER`, `DROP`, `DESCRIBE` on all tables (wildcard) |
 | **Data Location Grant** | `AWS::LakeFormation::Permissions` | Grants `DATA_LOCATION_ACCESS` to the Glue job role |
-| **External Principal** | `AWS::LakeFormation::Permissions` | (Optional) Grants `SELECT` to an external IAM role |
+| **External Principal** | `AWS::LakeFormation::Permissions` | (Optional) Grants `SELECT`, `DESCRIBE` on all tables to an external IAM role |
 
 ### How Access Control Works
 
@@ -396,10 +414,11 @@ The stack creates:
 | **S3 Buckets** | Data (CSV input), Processed (Parquet output + locks), Artifacts (Glue scripts) |
 | **SQS Queue** | Ingestion queue with DLQ for failed messages |
 | **Lambda Function** | SQS consumer that triggers Glue jobs |
-| **Glue Job** | Serverless PySpark ETL job |
-| **IAM Roles** | Lambda execution role, Glue job role, GitHub OIDC deploy role |
-| **Lake Formation** | Registered S3 location, Glue Catalog database + table, permissions |
-| **Glue Data Catalog** | Database `etl_processed_data` + table `csv_output` for Athena/Redshift/EMR querying |
+| **Glue Job** | Serverless PySpark ETL job — triggers crawler after writing Parquet |
+| **Glue Crawler** | Auto-discovers Parquet schema in processed bucket, updates Data Catalog |
+| **Glue Data Catalog** | Database `etl_processed_data` with auto-discovered tables |
+| **IAM Roles** | Lambda execution role, Glue job role (with crawler permissions), GitHub OIDC deploy role |
+| **Lake Formation** | Registered S3 location, database-level permissions (tables created dynamically by crawler) |
 | **CloudWatch Logs** | Lambda log group with configurable retention |
 
 ### Downstream Query Consumers (Not Created by Stack)
