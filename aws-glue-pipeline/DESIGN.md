@@ -600,6 +600,28 @@ Instead of Lambda directly calling Glue, use Step Functions for the workflow.
 
 ---
 
+## Design Pattern: Folder-Level Completion Trigger
+
+> **See [`FOLDER_TRIGGER_DESIGN.md`](FOLDER_TRIGGER_DESIGN.md) for the full design document covering:**
+> - Sentinel File approach (recommended) with architecture diagram, Lambda code changes, and Glue job modifications
+> - DynamoDB File Counter alternative
+> - Time Window (EventBridge Scheduler) alternative
+> - S3 Batch Operations + Manifest alternative
+> - Recommendation matrix and implementation effort comparison
+
+### Quick Summary
+
+The current pipeline triggers on **every individual `.csv` file**. To trigger only when **all files in a folder** have landed, the recommended approach is a **Sentinel File** pattern:
+
+1. **Upstream** uploads all data files, then uploads a `_COMPLETE` marker file last
+2. **S3 event** fires only on `_COMPLETE` suffix (change from `.csv`)
+3. **Lambda** extracts the folder prefix, lists all `.csv` files in that folder, acquires a folder-level lock, and starts a Glue job with all file paths
+4. **Glue job** reads all files, unions them, transforms, and writes a single Parquet output
+
+This requires minimal changes: S3 suffix filter (`_COMPLETE`), Lambda folder-listing logic, and Glue multi-file read support. No new AWS infrastructure needed.
+
+---
+
 ## Future Roadmap
 
 ### Short-Term (Next Sprint)
