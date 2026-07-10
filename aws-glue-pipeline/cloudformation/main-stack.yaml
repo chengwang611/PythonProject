@@ -294,6 +294,7 @@ Resources:
           DATA_BUCKET: !Sub '${DataBucketName}-${AWS::AccountId}-${EnvironmentName}'
           LOCK_BUCKET: !Sub '${ProcessedBucketName}-${AWS::AccountId}-${EnvironmentName}'
           LOCK_EXPIRY_DAYS: '7'
+          LOCK_STALE_TIMEOUT_SECONDS: '3600'
 
   # ============================================================
   # LAMBDA EVENT SOURCE MAPPING (SQS trigger)

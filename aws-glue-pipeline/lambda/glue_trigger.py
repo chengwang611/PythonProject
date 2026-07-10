@@ -16,13 +16,16 @@ Key differences from the file-level version:
   - Lists all .csv files in the folder before starting Glue job
   - Locks at the folder level (not per-file)
   - Passes a JSON array of file paths to the Glue job
+  - Stale lock detection: locks older than LOCK_STALE_TIMEOUT_SECONDS
+    are automatically deleted and re-acquired (handles Lambda crashes
+    between lock acquisition and Glue start)
 
 Environment Variables:
-  ENVIRONMENT           : dev/staging/prod
-  GLUE_JOB_NAME         : Name of the Glue job to trigger
-  GLUE_ARTIFACTS_BUCKET : S3 bucket with Glue scripts
-  PROCESSED_BUCKET      : S3 bucket for processed output
-  DATA_BUCKET           : S3 bucket for incoming CSV files
+  ENVIRONMENT                : dev/staging/prod
+  GLUE_JOB_NAME              : Name of the Glue job to trigger
+  GLUE_ARTIFACTS_BUCKET      : S3 bucket with Glue scripts
+  PROCESSED_BUCKET           : S3 bucket for processed output
+  DATA_BUCKET                : S3 bucket for incoming CSV files
   LOCK_BUCKET           : S3 bucket for distributed lock objects
   LOCK_EXPIRY_DAYS      : Days to retain lock objects (default: 7)
 """
@@ -60,6 +63,7 @@ PROCESSED_BUCKET = os.environ.get('PROCESSED_BUCKET', '')
 DATA_BUCKET = os.environ.get('DATA_BUCKET', '')
 LOCK_BUCKET = os.environ.get('LOCK_BUCKET', PROCESSED_BUCKET)
 LOCK_EXPIRY_DAYS = int(os.environ.get('LOCK_EXPIRY_DAYS', '7'))
+LOCK_STALE_TIMEOUT_SECONDS = int(os.environ.get('LOCK_STALE_TIMEOUT_SECONDS', '3600'))
 
 # Sentinel file name that signals folder completion
 SENTINEL_FILENAME = '_COMPLETE'
@@ -87,19 +91,76 @@ def _try_acquire_lock(folder_prefix: str) -> bool:
     Uses IfNoneMatch='*' which tells S3: "only create this object if
     it doesn't already exist." This is atomic at the S3 API level.
 
+    STALE LOCK DETECTION: If a lock already exists but is older than
+    LOCK_STALE_TIMEOUT_SECONDS (default: 1 hour), it is considered stale.
+    This handles the case where Lambda crashes after acquiring the lock
+    but before starting the Glue job — the stale lock is deleted and
+    a new one is acquired, allowing the folder to be processed.
+
+    A lock is NOT stale if a Glue job is actively running (the Glue job
+    releases the lock on success, so a long-running job's lock is valid).
+
     Returns:
-        True if lock was acquired (first time seeing this folder).
-        False if lock already exists (folder is being processed or was processed).
+        True if lock was acquired (first time or stale lock replaced).
+        False if lock already exists and is fresh (folder is being processed).
     """
     lock_bucket = LOCK_BUCKET
     lock_object_key = _lock_key_for_folder(folder_prefix)
     now = datetime.now(timezone.utc)
 
+    # ------------------------------------------------------------------
+    # Check for stale lock BEFORE attempting to acquire
+    # ------------------------------------------------------------------
+    try:
+        existing = s3_client.head_object(
+            Bucket=lock_bucket,
+            Key=lock_object_key,
+        )
+        last_modified = existing['LastModified']
+        lock_age_seconds = (now - last_modified).total_seconds()
+
+        if lock_age_seconds > LOCK_STALE_TIMEOUT_SECONDS:
+            logger.warning(
+                "Stale lock detected for folder '%s' (age: %.0fs > timeout: %ds). "
+                "Deleting stale lock and re-acquiring.",
+                folder_prefix, lock_age_seconds, LOCK_STALE_TIMEOUT_SECONDS,
+            )
+            s3_client.delete_object(
+                Bucket=lock_bucket,
+                Key=lock_object_key,
+            )
+            # Fall through to acquire a fresh lock below
+        else:
+            logger.warning(
+                "S3 lock already exists for folder '%s' (age: %.0fs) — "
+                "skipping duplicate (lock object: s3://%s/%s)",
+                folder_prefix, lock_age_seconds, lock_bucket, lock_object_key,
+            )
+            return False
+
+    except s3_client.exceptions.ClientError as exc:
+        # 404 = lock doesn't exist, which is expected — proceed to acquire
+        if exc.response['Error']['Code'] != '404':
+            logger.warning(
+                "S3 head_object failed for lock check (%s), "
+                "falling through to acquire: %s",
+                exc.response['Error']['Code'], exc,
+            )
+    except Exception as exc:
+        logger.warning(
+            "S3 lock staleness check failed (%s), falling through to "
+            "acquire (at-least-once): %s",
+            type(exc).__name__, exc,
+        )
+
+    # ------------------------------------------------------------------
+    # Acquire fresh lock
+    # ------------------------------------------------------------------
     lock_payload = json.dumps({
         'folder_prefix': folder_prefix,
         'locked_at': now.isoformat(),
         'environment': ENVIRONMENT,
-        'lock_version': '2',  # v2 = folder-level locking
+        'lock_version': '3',  # v3 = folder-level locking with stale detection
         'trigger_type': 'sentinel',
     })
 
@@ -123,8 +184,11 @@ def _try_acquire_lock(folder_prefix: str) -> bool:
         return True
 
     except s3_client.exceptions.PreconditionFailed:
+        # Race condition: another Lambda acquired the lock between our
+        # head_object check and this put_object. This is safe — the other
+        # Lambda will process the folder.
         logger.warning(
-            "S3 lock already exists for folder '%s' — skipping duplicate "
+            "S3 lock race for folder '%s' — another Lambda acquired it first "
             "(lock object: s3://%s/%s)",
             folder_prefix, lock_bucket, lock_object_key,
         )
@@ -132,7 +196,7 @@ def _try_acquire_lock(folder_prefix: str) -> bool:
 
     except Exception as exc:
         logger.warning(
-            "S3 lock check failed (%s), falling through to process "
+            "S3 lock acquisition failed (%s), falling through to process "
             "(at-least-once): %s",
             type(exc).__name__, exc,
         )
