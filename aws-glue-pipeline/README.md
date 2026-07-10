@@ -16,30 +16,69 @@ A **serverless** event-driven ETL pipeline that automatically processes CSV file
 ## Architecture
 
 ```
+                              ┌─────────────────────────────────────────────────────────────────────────────┐
+                              │                        AWS LAKE FORMATION (Governance Layer)                 │
+                              │  ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐  │
+                              │  │  Column-Level       │  │  Row-Level          │  │  Cell-Level         │  │
+                              │  │  Security           │  │  Filtering          │  │  Masking (PII)      │  │
+                              │  └─────────────────────┘  └─────────────────────┘  └─────────────────────┘  │
+                              └─────────────────────────────────────────────────────────────────────────────┘
+                                                          │
+                                                          │ Governs Access
+                                                          ▼
 ┌──────────────┐     S3 Event     ┌──────────────┐     SQS Message     ┌──────────────────────┐
 │   S3 Bucket  │ ───────────────► │  SQS Queue   │ ──────────────────► │    Lambda            │
 │  (CSV Drop)  │                  │ (Ingestion)  │                     │  (S3 Conditional Put) │
-└──────────────┘                  └──────────────┘                     └──────────┬───────────┘
-                                                                                  │
-                                                                            ┌─────▼──────┐
-                                                                            │  S3 Bucket │
-                                                                            │  (_locks/) │
-                                                                            └─────┬──────┘
-                                                                                  │
-                                                                      ┌───────────▼───────────┐
-                                                                      │  IfNoneMatch='*'      │
-                                                                      │  (Atomic Check-Set)   │
-                                                                      └───────────┬───────────┘
-                                                                                  │
-                                                                     ┌────────────▼────────────┐
-                                                                     │  Glue: StartJobRun      │
-                                                                     │  (Serverless Spark)     │
-                                                                     └────────────┬────────────┘
-                                                                                  │
-                                                                          ┌───────▼────────┐
-                                                                          │  S3 Processed   │
-                                                                          │  (Parquet Out)  │
-                                                                          └────────────────┘
+└──────────────┘                  └──────┬───────┘                     └──────────┬───────────┘
+                                        │                                        │
+                                        │ DLQ                                    │
+                                   ┌────▼────┐                            ┌──────▼──────┐
+                                   │   DLQ   │                            │  S3 Bucket  │
+                                   │ (Failed)│                            │  (_locks/)  │
+                                   └─────────┘                            └──────┬──────┘
+                                                                                │
+                                                                    ┌───────────▼───────────┐
+                                                                    │  IfNoneMatch='*'      │
+                                                                    │  (Atomic Check-Set)   │
+                                                                    └───────────┬───────────┘
+                                                                                │
+                                                                   ┌────────────▼────────────┐
+                                                                   │  Glue: StartJobRun      │
+                                                                   │  (Serverless Spark)     │
+                                                                   └────────────┬────────────┘
+                                                                                │
+                                                                        ┌───────▼────────┐
+                                                                        │  S3 Processed   │
+                                                                        │  (Parquet Out)  │
+                                                                        └───────┬────────┘
+                                                                                │
+                                                                   ┌────────────▼────────────┐
+                                                                   │   AWS Glue Data Catalog  │
+                                                                   │  ┌────────────────────┐  │
+                                                                   │  │ Database:          │  │
+                                                                   │  │ etl_processed_data │  │
+                                                                   │  │                    │  │
+                                                                   │  │ Table: csv_output  │  │
+                                                                   │  │ (Parquet, LF-gov)  │  │
+                                                                   │  └────────────────────┘  │
+                                                                   └────────────┬────────────┘
+                                                                                │
+                                                          ┌─────────────────────┼─────────────────────┐
+                                                          │                     │                     │
+                                                          ▼                     ▼                     ▼
+                                              ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
+                                              │  Amazon Athena   │  │ Redshift Spectrum│  │   Amazon EMR     │
+                                              │  (SQL Queries)   │  │  (Federated)     │  │  (Spark/Hive)    │
+                                              └────────┬─────────┘  └──────────────────┘  └──────────────────┘
+                                                       │
+                                                       │ SQL via Lake Formation
+                                                       ▼
+                                              ┌──────────────────┐
+                                              │  Data Analyst /  │
+                                              │  BI Tool         │
+                                              │  (QuickSight,    │
+                                              │   Tableau, etc.) │
+                                              └──────────────────┘
 ```
 
 ### Data Flow
@@ -60,6 +99,10 @@ A **serverless** event-driven ETL pipeline that automatically processes CSV file
    - Writes `_SUCCESS` dedup marker and `_MANIFEST.json`
 5. **SQS message is deleted** after successful processing
 6. **Failed messages** go to a Dead Letter Queue (DLQ)
+7. **Glue Data Catalog** registers the processed Parquet data as a table (`etl_processed_data.csv_output`)
+8. **Lake Formation** governs all access to the catalog table — enforcing column-level, row-level, and cell-level security
+9. **Amazon Athena** (and Redshift Spectrum, EMR) queries the data through Lake Formation, which authorizes every request
+10. **BI tools** (QuickSight, Tableau) connect via Athena JDBC/ODBC to visualize the governed data
 
 ## Project Structure
 
@@ -235,23 +278,54 @@ The CloudFormation stack creates these Lake Formation resources:
 ### How Access Control Works
 
 ```
-User/Role
-    │
-    ▼
-Lake Formation (Policy Engine)
-    │
-    ├── Database: etl_processed_data
-    │     └── Table: csv_output
-    │           ├── Column-level: hide PII columns from analysts
-    │           ├── Row-level: filter by region/department
-    │           └── Cell-level: mask sensitive values
-    │
-    ▼
-S3 Processed Bucket (IAM + Lake Formation)
-    │
-    ▼
-Data Access (Athena, Redshift, Glue)
+                         ┌──────────────────────────────────────────┐
+                         │         Lake Formation Policy Engine      │
+                         │                                          │
+                         │  ┌────────────────────────────────────┐  │
+                         │  │  Database: etl_processed_data       │  │
+                         │  │  ┌────────────────────────────────┐ │  │
+                         │  │  │  Table: csv_output              │ │  │
+                         │  │  │                                 │ │  │
+                         │  │  │  ├── Column-level: hide PII     │ │  │
+                         │  │  │  ├── Row-level: filter by dept  │ │  │
+                         │  │  │  └── Cell-level: mask SSN/CC    │ │  │
+                         │  │  └────────────────────────────────┘ │  │
+                         │  └────────────────────────────────────┘  │
+                         └──────────────────┬───────────────────────┘
+                                            │
+              ┌─────────────────────────────┼─────────────────────────────┐
+              │                             │                             │
+              ▼                             ▼                             ▼
+   ┌──────────────────┐          ┌──────────────────┐          ┌──────────────────┐
+   │  Glue Job Role   │          │  Data Analyst     │          │  External Account │
+   │  (Writer)        │          │  (Reader)         │          │  (Cross-Account)  │
+   │                  │          │                   │          │                   │
+   │  Permissions:    │          │  Permissions:     │          │  Permissions:     │
+   │  SELECT, INSERT, │          │  SELECT, DESCRIBE │          │  SELECT, DESCRIBE │
+   │  ALTER, DROP,    │          │                   │          │                   │
+   │  DESCRIBE        │          │                   │          │                   │
+   └────────┬─────────┘          └────────┬──────────┘          └────────┬──────────┘
+            │                             │                             │
+            ▼                             ▼                             ▼
+   ┌──────────────────┐          ┌──────────────────┐          ┌──────────────────┐
+   │  Writes Parquet  │          │  Amazon Athena   │          │  Amazon Athena   │
+   │  to S3 + Catalog │          │  (SQL Queries)   │          │  (Cross-Account) │
+   └──────────────────┘          └────────┬─────────┘          └────────┬─────────┘
+                                          │                             │
+                                          ▼                             ▼
+                                 ┌──────────────────┐          ┌──────────────────┐
+                                 │  QuickSight /    │          │  QuickSight /    │
+                                 │  Tableau / etc.  │          │  Tableau / etc.  │
+                                 └──────────────────┘          └──────────────────┘
 ```
+
+**Authorization Flow:**
+1. User/Role requests data via Athena (or Redshift Spectrum, EMR)
+2. Athena queries the **Glue Data Catalog** for table metadata (`etl_processed_data.csv_output`)
+3. Lake Formation intercepts the request and checks permissions against its policy engine
+4. If authorized, Lake Formation issues **temporary credentials** scoped to the allowed columns/rows
+5. Athena reads only the authorized data from the **S3 Processed Bucket**
+6. Results are returned to the user with PII masked, rows filtered, and columns restricted per policy
 
 ### Lake Formation Parameters
 
@@ -325,7 +399,19 @@ The stack creates:
 | **Glue Job** | Serverless PySpark ETL job |
 | **IAM Roles** | Lambda execution role, Glue job role, GitHub OIDC deploy role |
 | **Lake Formation** | Registered S3 location, Glue Catalog database + table, permissions |
+| **Glue Data Catalog** | Database `etl_processed_data` + table `csv_output` for Athena/Redshift/EMR querying |
 | **CloudWatch Logs** | Lambda log group with configurable retention |
+
+### Downstream Query Consumers (Not Created by Stack)
+
+These AWS services query the Lake Formation-governed data through the Glue Data Catalog:
+
+| Service | Access Method | Use Case |
+|---------|--------------|----------|
+| **Amazon Athena** | SQL via Glue Catalog + Lake Formation | Ad-hoc queries, BI dashboards (QuickSight, Tableau) |
+| **Redshift Spectrum** | Federated queries via Glue Catalog | Data warehouse queries across S3 + Redshift tables |
+| **Amazon EMR** | Spark/Hive via Glue Catalog | Advanced analytics, ML feature engineering |
+| **SageMaker** | Data Wrangler / Processing Jobs | ML training data preparation |
 
 ### Parameters
 
