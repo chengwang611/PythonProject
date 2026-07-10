@@ -361,15 +361,31 @@ CSV Input
 | # | Failure Scenario | Layer 1 (S3 Lock) | Layer 2 (S3 Marker) | Result |
 |---|-----------------|-------------------|---------------------|--------|
 | 1 | Lambda crashes before lock | No lock → retry | N/A | **Retried** ✅ |
-| 2 | Lambda crashes after lock, before Glue start | Lock exists → skip | N/A | **Exactly once** ✅ |
-| 3 | Lambda crashes after Glue start, before SQS delete | Lock exists → skip | Marker may exist → skip | **Exactly once** ✅ |
-| 4 | Glue job fails (transient) | Lock released → retry | No marker → process | **Retried** ✅ |
-| 5 | Glue job fails (permanent) | Lock released → retry | No marker → process | **Retried** (then DLQ) |
-| 6 | Same file uploaded twice | Lock from first exists → skip | N/A | **Exactly once** ✅ |
+| 2 | Lambda crashes after lock, before Glue start | Lock exists → stale detection after 1h → delete + re-acquire | N/A | **Retried** ✅ (stale lock recovery) |
+| 3 | Lambda crashes after Glue start, before SQS delete | Lock exists (fresh, Glue running) → skip | Marker may exist → skip | **Exactly once** ✅ |
+| 4 | Glue job fails (transient) | Lock released by Lambda on start failure → retry | No marker → process | **Retried** ✅ |
+| 5 | Glue job fails (permanent) | Lock stays (not stale — Glue was running) | No marker → process | **Locked** (manual intervention or 7-day expiry) |
+| 6 | Same folder uploaded twice | Lock from first exists → skip | N/A | **Exactly once** ✅ |
 | 7 | S3 duplicate event | Lock from first exists → skip | N/A | **Exactly once** ✅ |
 | 8 | S3 unavailable during lock | Exception → fall through | Marker check catches | **At-least-once** ⚠️ |
 
 **⚠️ Scenario 8** is the only case where exactly-once degrades to at-least-once. This is an intentional trade-off: blocking the pipeline during an S3 outage is worse than rare duplicates.
+
+### Stale Lock Detection
+
+The Lambda implements **stale lock detection** to handle the case where it crashes after acquiring the lock but before starting the Glue job (Scenario 2). Without this, the folder would be stuck forever.
+
+**How it works** ([`glue_trigger.py`](lambda/glue_trigger.py)):
+
+1. Before acquiring a lock, the Lambda calls `s3.head_object()` to check if a lock already exists
+2. If the lock exists, it reads `LastModified` to calculate the lock's age
+3. If `lock_age > LOCK_STALE_TIMEOUT_SECONDS` (default: 3600 = 1 hour), the lock is **stale**:
+   - Delete the stale lock
+   - Acquire a fresh lock
+   - Process the folder
+4. If the lock is fresh (≤ 1 hour old), skip — the folder is being processed
+
+**Why 1 hour?** A Glue job that runs longer than 1 hour is unusual for CSV ETL. If a legitimate job runs longer, the lock is still valid because the Glue job releases it on success — the lock only becomes stale if the Lambda crashed and no Glue job was ever started.
 
 ---
 

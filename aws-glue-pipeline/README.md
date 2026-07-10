@@ -465,10 +465,11 @@ The Lambda ([`glue_trigger.py`](aws-glue-pipeline/lambda/glue_trigger.py)) is tr
 | `ENVIRONMENT` | Environment name |
 | `GLUE_JOB_NAME` | Glue job name to trigger |
 | `GLUE_ARTIFACTS_BUCKET` | Bucket with Glue scripts |
-| `PROCESSED_BUCKET` | Output bucket |
+| `PROCESSED_BUCKET` | Output bucket (also used for lock storage) |
 | `DATA_BUCKET` | Input bucket |
 | `LOCK_BUCKET` | Bucket for distributed locks |
-| `LOCK_EXPIRY_DAYS` | Lock retention (default: 7) |
+| `LOCK_EXPIRY_DAYS` | Lock retention via S3 lifecycle (default: 7) |
+| `LOCK_STALE_TIMEOUT_SECONDS` | Stale lock detection threshold (default: 3600 = 1 hour) |
 
 ## Glue Job Details
 

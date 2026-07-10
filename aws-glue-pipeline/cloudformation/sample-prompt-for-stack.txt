@@ -1,0 +1,29 @@
+Act as a Principal AWS Data Architect. Write a production-ready AWS CDK v2 Stack in Python that implements a serverless, event-driven data ingestion pipeline.
+
+The pipeline should follow these architectural requirements and data flows:
+
+1. Storage & Messaging:
+   - Create a 'DataBucket' for raw CSV inputs.
+   - Create a 'ProcessedBucket' for clean Parquet outputs. It must include a lifecycle rule to automatically expire objects under the '_locks/' prefix after 7 days.
+   - Create an SQS IngestionQueue with a Visibility Timeout of 15 minutes, backed by a Dead Letter Queue (DLQ) that captures messages after 5 failed retries.
+   - Configure an S3 Event Notification on the DataBucket to send events to the SQS queue, but ONLY when an object ending with the suffix '_COMPLETE' is created.
+
+2. Event Orchestration (Lambda):
+   - Create a Python 3.11 Lambda function acting as the orchestrator, triggered by the SQS queue (BatchSize = 1).
+   - The Lambda needs iam permissions to read/write to the S3 buckets and action 'glue:StartJobRun' for the ETL job.
+   - Map a local directory 'lambda/' as the source code asset for this Lambda.
+
+3. Big Data Compute & Catalog (AWS Glue 5.0):
+   - Create a Glue Data Catalog Database for the processed data.
+   - Create an AWS Glue 5.0 (Serverless Apache Spark) Job utilizing G.1X workers. Pass the processed bucket name as a default argument.
+   - Create a Glue Crawler configured to automatically scan the ProcessedBucket's output directory, update the schema in the Glue Database, and inherit partitions.
+   - Grant the Glue Job Role the minimum necessary IAM policies to read raw data, write processed data, and trigger the Glue Crawler ('glue:StartCrawler').
+
+4. Data Governance (AWS Lake Formation):
+   - Register the ProcessedBucket S3 path as a Lake Formation Data Lake Location.
+   - Create Lake Formation Permissions that grant the Glue Job Role 'CREATE_TABLE', 'ALTER', 'DROP', and 'DESCRIBE' permissions on the Glue Catalog Database.
+
+Best Practices to follow:
+- Apply the Principle of Least Privilege: Use CDK's `.grant_read()` and `.grant_read_write()` convenience methods instead of writing manual, sweeping IAM inline policy JSONs.
+- Parameterize names using an 'environment' variable (e.g., 'dev') to make the stack multi-environment friendly.
+- Do not use hardcoded AWS Account IDs or Regions; leverage CDK tokens like `self.account` and `self.region`.
