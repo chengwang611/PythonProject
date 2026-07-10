@@ -2,6 +2,7 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   AWS Glue ETL Pipeline - S3 Event → SQS → Lambda → Glue (PySpark)
   Serverless CSV ingestion pipeline using AWS Glue instead of EMR.
+  Uses AWS Lake Formation for fine-grained access control on the processed S3 bucket.
 
 Parameters:
   EnvironmentName:
@@ -54,6 +55,24 @@ Parameters:
     Type: String
     Description: S3 bucket name where processed output is stored.
 
+  LakeFormationDatabaseName:
+    Type: String
+    Default: etl_processed_data
+    Description: Name of the Lake Formation database for processed data.
+
+  LakeFormationTableName:
+    Type: String
+    Default: csv_output
+    Description: Name of the Lake Formation table for processed CSV/Parquet data.
+
+  ProcessedDataLakePrincipal:
+    Type: String
+    Default: ''
+    Description: >
+      IAM role ARN or user ARN to grant Lake Formation data access to
+      (e.g., 'arn:aws:iam::123456789012:role/DataAnalystRole').
+      Leave empty to grant access only to the Glue job role.
+
   LambdaMemorySize:
     Type: Number
     Default: 256
@@ -93,6 +112,7 @@ Parameters:
 
 Conditions:
   HasVpcConfig: !Not [!Equals [!Ref VpcId, '']]
+  HasExternalPrincipal: !Not [!Equals [!Ref ProcessedDataLakePrincipal, '']]
 
 Resources:
   # ============================================================
@@ -339,6 +359,36 @@ Resources:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
                 Resource: '*'
+              # Lake Formation permissions — allows Glue to read/write
+              # data governed by Lake Formation
+              - Effect: Allow
+                Action:
+                  - lakeformation:GetDataAccess
+                  - lakeformation:GetDataLakeSettings
+                  - lakeformation:ListPermissions
+                  - lakeformation:ListResources
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:DeleteTable
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:BatchCreatePartition
+                  - glue:BatchGetPartition
+                  - glue:CreatePartition
+                  - glue:UpdatePartition
+                  - glue:DeletePartition
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${LakeFormationDatabaseName}'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${LakeFormationDatabaseName}/*'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:userDefinedFunction/${LakeFormationDatabaseName}/*'
 
   # ============================================================
   # GLUE JOB
@@ -372,6 +422,156 @@ Resources:
           Value: !Ref EnvironmentName
         - Key: Project
           Value: Glue-ETL-Pipeline
+
+  # ============================================================
+  # LAKE FORMATION — DATA ACCESS CONTROL
+  # ============================================================
+  # Lake Formation provides fine-grained access control on the processed
+  # S3 bucket. Instead of granting direct S3 access, we register the
+  # processed bucket path as a Lake Formation resource and grant
+  # permissions through Lake Formation.
+  #
+  # This allows:
+  #   - Column-level security (e.g., hide PII columns from certain roles)
+  #   - Row-level filtering (e.g., only show rows where region='US')
+  #   - Time-based access controls
+  #   - Audit trail of all data access
+
+  # Register the processed bucket as a Lake Formation resource
+  # This tells Lake Formation to govern access to this S3 location
+  LakeFormationProcessedDataLocation:
+    Type: AWS::LakeFormation::Resource
+    DependsOn: ProcessedBucket
+    Properties:
+      ResourceArn: !Sub 'arn:aws:s3:::${ProcessedBucket}-${AWS::AccountId}-${EnvironmentName}'
+      UseServiceLinkedRole: true
+
+  # Create a Lake Formation database for the processed data
+  # This database will contain tables that point to the processed S3 data
+  ProcessedDataDatabase:
+    Type: AWS::Glue::Database
+    DependsOn: LakeFormationProcessedDataLocation
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref LakeFormationDatabaseName
+        Description: !Sub 'Lake Formation governed database for processed ETL data in ${EnvironmentName}'
+        LocationUri: !Sub 's3://${ProcessedBucket}-${AWS::AccountId}-${EnvironmentName}/'
+        Parameters:
+          environment: !Ref EnvironmentName
+          managedBy: CloudFormation
+          lakeFormationManaged: 'true'
+
+  # Create a table in the Lake Formation database
+  # This table represents the Parquet output written by the Glue job
+  ProcessedDataTable:
+    Type: AWS::Glue::Table
+    DependsOn: ProcessedDataDatabase
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref LakeFormationDatabaseName
+      TableInput:
+        Name: !Ref LakeFormationTableName
+        Description: !Sub 'Processed CSV data in Parquet format — governed by Lake Formation'
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          environment: !Ref EnvironmentName
+          lakeFormationManaged: 'true'
+        StorageDescriptor:
+          Location: !Sub 's3://${ProcessedBucket}-${AWS::AccountId}-${EnvironmentName}/output/'
+          InputFormat: 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat'
+          OutputFormat: 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat'
+          SerdeInfo:
+            SerializationLibrary: 'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe'
+            Parameters:
+              serialization.format: '1'
+          Columns:
+            - Name: partition_0
+              Type: string
+            - Name: partition_1
+              Type: string
+          NumberOfBuckets: -1
+          Compressed: true
+          StoredAsSubDirectories: false
+
+  # Grant the Glue job role full access to the Lake Formation database
+  # This allows the Glue job to write data that is governed by Lake Formation
+  GlueJobLakeFormationDatabaseGrant:
+    Type: AWS::LakeFormation::Permissions
+    DependsOn:
+      - ProcessedDataDatabase
+      - GlueJobRole
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: !GetAtt GlueJobRole.Arn
+      Resource:
+        DatabaseResource:
+          CatalogId: !Ref AWS::AccountId
+          Name: !Ref LakeFormationDatabaseName
+      Permissions:
+        - CREATE_TABLE
+        - ALTER
+        - DROP
+      PermissionsWithGrantOption:
+        - CREATE_TABLE
+
+  # Grant the Glue job role full access to the Lake Formation table
+  GlueJobLakeFormationTableGrant:
+    Type: AWS::LakeFormation::Permissions
+    DependsOn:
+      - ProcessedDataTable
+      - GlueJobRole
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: !GetAtt GlueJobRole.Arn
+      Resource:
+        TableResource:
+          CatalogId: !Ref AWS::AccountId
+          DatabaseName: !Ref LakeFormationDatabaseName
+          Name: !Ref LakeFormationTableName
+      Permissions:
+        - SELECT
+        - INSERT
+        - ALTER
+        - DROP
+        - DESCRIBE
+
+  # Grant the Glue job role access to the registered S3 location
+  GlueJobLakeFormationDataLocationGrant:
+    Type: AWS::LakeFormation::Permissions
+    DependsOn:
+      - LakeFormationProcessedDataLocation
+      - GlueJobRole
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: !GetAtt GlueJobRole.Arn
+      Resource:
+        DataLocationResource:
+          CatalogId: !Ref AWS::AccountId
+          S3Resource: !Sub 'arn:aws:s3:::${ProcessedBucket}-${AWS::AccountId}-${EnvironmentName}'
+      Permissions:
+        - DATA_LOCATION_ACCESS
+
+  # If a data lake principal is specified, grant them SELECT access
+  # This allows external roles (e.g., data analysts) to query the processed data
+  # through Athena or Redshift Spectrum, governed by Lake Formation
+  ExternalPrincipalTableGrant:
+    Type: AWS::LakeFormation::Permissions
+    Condition: HasExternalPrincipal
+    DependsOn:
+      - ProcessedDataTable
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: !Ref ProcessedDataLakePrincipal
+      Resource:
+        TableResource:
+          CatalogId: !Ref AWS::AccountId
+          DatabaseName: !Ref LakeFormationDatabaseName
+          Name: !Ref LakeFormationTableName
+      Permissions:
+        - SELECT
+        - DESCRIBE
 
   # ============================================================
   # GITHUB OIDC ROLE FOR DEPLOYMENT
@@ -487,3 +687,21 @@ Outputs:
     Value: !Ref ProcessedBucket
     Export:
       Name: !Sub '${AWS::StackName}-LockBucketName'
+
+  LakeFormationDatabaseName:
+    Description: Lake Formation database for processed data
+    Value: !Ref LakeFormationDatabaseName
+    Export:
+      Name: !Sub '${AWS::StackName}-LakeFormationDatabaseName'
+
+  LakeFormationTableName:
+    Description: Lake Formation table for processed data
+    Value: !Ref LakeFormationTableName
+    Export:
+      Name: !Sub '${AWS::StackName}-LakeFormationTableName'
+
+  LakeFormationProcessedLocationArn:
+    Description: ARN of the Lake Formation registered S3 location
+    Value: !Sub 'arn:aws:s3:::${ProcessedBucket}-${AWS::AccountId}-${EnvironmentName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-LakeFormationProcessedLocationArn'

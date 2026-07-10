@@ -1,6 +1,6 @@
 # AWS Glue ETL Pipeline - S3 → SQS → Lambda → Glue (PySpark)
 
-A **serverless** event-driven ETL pipeline that automatically processes CSV files dropped into an S3 bucket using **AWS Glue** (instead of EMR). Designed for **exactly-once processing** using S3 conditional put (`IfNoneMatch='*'`) — no DynamoDB needed.
+A **serverless** event-driven ETL pipeline that automatically processes CSV files dropped into an S3 bucket using **AWS Glue** (instead of EMR). Designed for **exactly-once processing** using S3 conditional put (`IfNoneMatch='*'`) — no DynamoDB needed. Uses **AWS Lake Formation** for fine-grained access control on the processed data.
 
 ## Why Glue Instead of EMR?
 
@@ -205,6 +205,114 @@ make deploy ENVIRONMENT=dev
 
 Push to `main` to trigger automated validation, packaging, and deployment.
 
+## AWS Lake Formation Access Control
+
+The processed S3 bucket is governed by **AWS Lake Formation** for fine-grained access control. Instead of granting direct S3 bucket policies, all access to the processed data goes through Lake Formation.
+
+### Why Lake Formation?
+
+| Capability | Without Lake Formation | With Lake Formation |
+|-----------|----------------------|-------------------|
+| **Access control** | S3 bucket policies (all-or-nothing) | **Column-level**, row-level, cell-level |
+| **Audit** | CloudTrail S3 events | **Built-in** Lake Formation audit |
+| **Data sharing** | Complex cross-account IAM | **Simplified** with Lake Formation |
+| **Query engines** | Manual policy for each engine | **Unified** — Athena, Redshift, EMR, Glue |
+| **PII protection** | Application-level only | **Database-level** column masking |
+
+### Resources Created
+
+The CloudFormation stack creates these Lake Formation resources:
+
+| Resource | Type | Description |
+|----------|------|-------------|
+| **Processed S3 Location** | `AWS::LakeFormation::Resource` | Registers the processed bucket as a Lake Formation governed location |
+| **`etl_processed_data`** | `AWS::Glue::Database` | Glue Catalog database pointing to the processed bucket |
+| **`csv_output`** | `AWS::Glue::Table` | Glue Catalog table for Parquet output, governed by Lake Formation |
+| **Glue Job Permissions** | `AWS::LakeFormation::Permissions` | Grants the Glue job role `SELECT`, `INSERT`, `ALTER`, `DROP` on the table |
+| **Data Location Grant** | `AWS::LakeFormation::Permissions` | Grants `DATA_LOCATION_ACCESS` to the Glue job role |
+| **External Principal** | `AWS::LakeFormation::Permissions` | (Optional) Grants `SELECT` to an external IAM role |
+
+### How Access Control Works
+
+```
+User/Role
+    │
+    ▼
+Lake Formation (Policy Engine)
+    │
+    ├── Database: etl_processed_data
+    │     └── Table: csv_output
+    │           ├── Column-level: hide PII columns from analysts
+    │           ├── Row-level: filter by region/department
+    │           └── Cell-level: mask sensitive values
+    │
+    ▼
+S3 Processed Bucket (IAM + Lake Formation)
+    │
+    ▼
+Data Access (Athena, Redshift, Glue)
+```
+
+### Lake Formation Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `LakeFormationDatabaseName` | `etl_processed_data` | Name of the Lake Formation database |
+| `LakeFormationTableName` | `csv_output` | Name of the Lake Formation table |
+| `ProcessedDataLakePrincipal` | (empty) | IAM role ARN to grant SELECT access (e.g., for data analysts) |
+
+### Granting Access to External Users
+
+To grant a data analyst role access to query the processed data through Athena:
+
+```bash
+# Deploy with the external principal parameter
+aws cloudformation deploy \
+  --parameter-overrides \
+    ProcessedDataLakePrincipal="arn:aws:iam::123456789012:role/DataAnalystRole"
+```
+
+The analyst can then query using Athena:
+
+```sql
+SELECT * FROM etl_processed_data.csv_output LIMIT 10;
+```
+
+Lake Formation will enforce column-level and row-level permissions automatically.
+
+### Querying Processed Data with Athena
+
+Once the pipeline runs and data is written to the processed bucket, you can query it through Amazon Athena:
+
+```sql
+-- Create the database (if not already created by CloudFormation)
+CREATE DATABASE IF NOT EXISTS etl_processed_data;
+
+-- Query the processed data
+SELECT * FROM etl_processed_data.csv_output LIMIT 100;
+
+-- Aggregation example
+SELECT partition_0, COUNT(*) as record_count
+FROM etl_processed_data.csv_output
+GROUP BY partition_0;
+```
+
+### Monitoring Lake Formation Access
+
+```bash
+# List Lake Formation permissions
+aws lakeformation list-permissions \
+  --resource-type TABLE \
+  --query "PrincipalResourcePermissions[0:10]"
+
+# View data lake settings
+aws lakeformation get-data-lake-settings
+
+# Check registered locations
+aws lakeformation list-resources \
+  --query "ResourceInfoList[0:5].[ResourceArn,RoleArn,LastModified]"
+```
+
 ## CloudFormation Stack Details
 
 The stack creates:
@@ -216,6 +324,7 @@ The stack creates:
 | **Lambda Function** | SQS consumer that triggers Glue jobs |
 | **Glue Job** | Serverless PySpark ETL job |
 | **IAM Roles** | Lambda execution role, Glue job role, GitHub OIDC deploy role |
+| **Lake Formation** | Registered S3 location, Glue Catalog database + table, permissions |
 | **CloudWatch Logs** | Lambda log group with configurable retention |
 
 ### Parameters
@@ -228,6 +337,9 @@ The stack creates:
 | `GlueJobTimeout` | `60` | Glue job timeout (minutes) |
 | `LambdaMemorySize` | `256` | Lambda memory (MB) |
 | `LambdaTimeout` | `120` | Lambda timeout (seconds) |
+| `LakeFormationDatabaseName` | `etl_processed_data` | Lake Formation database name |
+| `LakeFormationTableName` | `csv_output` | Lake Formation table name |
+| `ProcessedDataLakePrincipal` | (empty) | External IAM role for data access |
 
 ## Lambda Function Details
 

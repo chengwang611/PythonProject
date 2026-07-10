@@ -1,0 +1,193 @@
+name: Deploy AWS SageMaker ML Pipeline
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'aws-sagemaker-pipeline/**'
+      - '.github/workflows/deploy-sagemaker-pipeline.yml'
+  pull_request:
+    branches: [main, master]
+    paths:
+      - 'aws-sagemaker-pipeline/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  PYTHON_VERSION: '3.12'
+  AWS_REGION: us-east-1
+
+jobs:
+  validate:
+    name: Validate Templates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install cfn-lint
+          pip install sagemaker  # For pipeline definition generation
+
+      - name: Lint CloudFormation
+        run: cfn-lint aws-sagemaker-pipeline/cloudformation/*.yaml
+
+      - name: Validate Lambda syntax
+        run: python -m py_compile aws-sagemaker-pipeline/lambda/sagemaker_trigger.py
+
+      - name: Validate pipeline scripts
+        run: |
+          python -m py_compile aws-sagemaker-pipeline/pipeline/scripts/preprocess.py
+          python -m py_compile aws-sagemaker-pipeline/pipeline/scripts/train.py
+          python -m py_compile aws-sagemaker-pipeline/pipeline/scripts/evaluate.py
+
+      - name: Generate pipeline definition
+        run: |
+          python aws-sagemaker-pipeline/pipeline/pipeline_definition.py \
+            --environment ${{ github.event.inputs.environment || 'dev' }} \
+            --model-name customer-churn-model \
+            --output-path aws-sagemaker-pipeline/pipeline/pipeline-definition.json
+
+      - name: Validate pipeline definition JSON
+        run: |
+          python -c "
+          import json
+          with open('aws-sagemaker-pipeline/pipeline/pipeline-definition.json') as f:
+              data = json.load(f)
+          print(f'✓ Valid JSON with {len(data.get(\"Steps\", []))} steps')
+          for step in data.get('Steps', []):
+              print(f'  - {step[\"Name\"]} ({step[\"Type\"]})')
+          "
+
+  package:
+    name: Package and Upload
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Generate pipeline definition
+        run: |
+          pip install sagemaker
+          python aws-sagemaker-pipeline/pipeline/pipeline_definition.py \
+            --environment ${{ github.event.inputs.environment || 'dev' }} \
+            --model-name customer-churn-model \
+            --output-path aws-sagemaker-pipeline/pipeline/pipeline-definition.json
+
+      - name: Package Lambda
+        run: |
+          cd aws-sagemaker-pipeline/lambda
+          pip install -r requirements.txt -t ./package
+          cp sagemaker_trigger.py ./package/
+          cd package
+          zip -r9 ../sagemaker-trigger-${{ github.event.inputs.environment || 'dev' }}.zip .
+          cd ..
+          rm -rf package
+          aws s3 cp sagemaker-trigger-${{ github.event.inputs.environment || 'dev' }}.zip \
+            s3://${{ secrets.LAMBDA_ARTIFACTS_BUCKET }}/lambda/sagemaker-trigger-${{ github.event.inputs.environment || 'dev' }}.zip
+
+      - name: Upload pipeline artifacts
+        run: |
+          # Upload pipeline definition JSON
+          aws s3 cp aws-sagemaker-pipeline/pipeline/pipeline-definition.json \
+            s3://${{ secrets.PIPELINE_ARTIFACTS_BUCKET }}/pipeline/pipeline-definition.json
+
+          # Upload pipeline scripts
+          aws s3 cp aws-sagemaker-pipeline/pipeline/scripts/preprocess.py \
+            s3://${{ secrets.PIPELINE_ARTIFACTS_BUCKET }}/pipeline/scripts/preprocess.py
+          aws s3 cp aws-sagemaker-pipeline/pipeline/scripts/train.py \
+            s3://${{ secrets.PIPELINE_ARTIFACTS_BUCKET }}/pipeline/scripts/train.py
+          aws s3 cp aws-sagemaker-pipeline/pipeline/scripts/evaluate.py \
+            s3://${{ secrets.PIPELINE_ARTIFACTS_BUCKET }}/pipeline/scripts/evaluate.py
+
+      - name: Upload CloudFormation Templates
+        run: |
+          aws s3 cp aws-sagemaker-pipeline/cloudformation/main-stack.yaml \
+            s3://${{ secrets.CFN_TEMPLATES_BUCKET }}/sagemaker-pipeline/main-stack.yaml
+
+  deploy:
+    name: Deploy CloudFormation Stack
+    needs: package
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy CloudFormation Stack
+        run: |
+          ENV_NAME="${{ github.event.inputs.environment || 'dev' }}"
+          STACK_NAME="sagemaker-pipeline-${ENV_NAME}"
+
+          aws cloudformation deploy \
+            --template-file aws-sagemaker-pipeline/cloudformation/main-stack.yaml \
+            --stack-name "${STACK_NAME}" \
+            --capabilities CAPABILITY_NAMED_IAM CAPABILITY_IAM \
+            --parameter-overrides \
+              EnvironmentName="${ENV_NAME}" \
+              ModelName="customer-churn-model" \
+              LambdaS3Bucket="${{ secrets.LAMBDA_ARTIFACTS_BUCKET }}" \
+              PipelineArtifactsBucket="${{ secrets.PIPELINE_ARTIFACTS_BUCKET }}" \
+              DataBucketName="${{ secrets.DATA_BUCKET_NAME }}" \
+              GithubRepoOwner="${{ github.repository_owner }}" \
+              GithubRepoName="${{ github.event.repository.name }}" \
+              TrainingInstanceType="ml.m5.xlarge" \
+              TrainingInstanceCount="1" \
+              ProcessingInstanceType="ml.m5.xlarge" \
+              InferenceInstanceType="ml.m5.large" \
+              InferenceInstanceCount="1" \
+              LambdaMemorySize="256" \
+              LambdaTimeout="120" \
+              LogRetentionDays="30" \
+              SqsVisibilityTimeout="300" \
+            --tags \
+              Environment="${ENV_NAME}" \
+              Project="SageMaker-ML-Pipeline" \
+              ManagedBy="GitHubActions"
+
+      - name: Get Stack Outputs
+        run: |
+          ENV_NAME="${{ github.event.inputs.environment || 'dev' }}"
+          STACK_NAME="sagemaker-pipeline-${ENV_NAME}"
+          aws cloudformation describe-stacks \
+            --stack-name "${STACK_NAME}" \
+            --query "Stacks[0].Outputs" \
+            --output table

@@ -1,0 +1,416 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AWS SageMaker ML Pipeline - End-to-end ML workflow with SageMaker Pipelines.
+  Includes: data processing, training, evaluation, model registration, and deployment.
+  Triggered via S3 event → SQS → Lambda for automated retraining.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name used for resource naming.
+
+  ModelName:
+    Type: String
+    Default: customer-churn-model
+    Description: Name of the ML model.
+
+  TrainingInstanceType:
+    Type: String
+    Default: ml.m5.xlarge
+    Description: SageMaker training instance type.
+
+  TrainingInstanceCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 64
+    Description: Number of training instances.
+
+  ProcessingInstanceType:
+    Type: String
+    Default: ml.m5.xlarge
+    Description: SageMaker processing instance type.
+
+  InferenceInstanceType:
+    Type: String
+    Default: ml.m5.large
+    Description: SageMaker inference endpoint instance type.
+
+  InferenceInstanceCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 10
+    Description: Number of inference instances.
+
+  LambdaS3Bucket:
+    Type: String
+    Description: S3 bucket name where Lambda deployment packages are stored.
+
+  PipelineArtifactsBucket:
+    Type: String
+    Description: S3 bucket name for SageMaker pipeline artifacts.
+
+  DataBucketName:
+    Type: String
+    Description: S3 bucket name where training data is uploaded.
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    MinValue: 128
+    MaxValue: 10240
+
+  LambdaTimeout:
+    Type: Number
+    Default: 120
+    MinValue: 1
+    MaxValue: 900
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+
+  SqsVisibilityTimeout:
+    Type: Number
+    Default: 300
+
+  GithubRepoOwner:
+    Type: String
+    Description: GitHub repository owner for OIDC authentication.
+
+  GithubRepoName:
+    Type: String
+    Description: GitHub repository name for OIDC authentication.
+
+Conditions:
+  HasVpcConfig: !Not [!Equals [!Ref VpcId, '']]
+
+Resources:
+  # ============================================================
+  # S3 BUCKETS
+  # ============================================================
+  DataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${DataBucketName}-${AWS::AccountId}-${EnvironmentName}'
+      VersioningConfiguration:
+        Status: Enabled
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: s3:ObjectCreated:Put
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .csv
+            Queue: !GetAtt TrainingTriggerQueue.Arn
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  PipelineArtifactsBucketResource:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${PipelineArtifactsBucket}-${AWS::AccountId}-${EnvironmentName}'
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireTempArtifacts
+            Status: Enabled
+            ExpirationInDays: 90
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ============================================================
+  # SQS QUEUE
+  # ============================================================
+  TrainingTriggerQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${EnvironmentName}-training-trigger-queue'
+      VisibilityTimeout: !Ref SqsVisibilityTimeout
+      MessageRetentionPeriod: 1209600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt TrainingTriggerDeadLetterQueue.Arn
+        maxReceiveCount: 5
+
+  TrainingTriggerDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${EnvironmentName}-training-trigger-dlq'
+      MessageRetentionPeriod: 1209600
+
+  TrainingTriggerQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref TrainingTriggerQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt TrainingTriggerQueue.Arn
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:s3:::${DataBucket}-${AWS::AccountId}-${EnvironmentName}'
+
+  # ============================================================
+  # LAMBDA FUNCTION (SQS → SageMaker Pipeline Trigger)
+  # ============================================================
+  PipelineTriggerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-sagemaker-trigger-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SageMakerTriggerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt TrainingTriggerQueue.Arn
+              - Effect: Allow
+                Action:
+                  - sagemaker:StartPipelineExecution
+                  - sagemaker:DescribePipelineExecution
+                  - sagemaker:ListPipelineExecutions
+                Resource:
+                  - !Sub 'arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:pipeline/${SageMakerPipeline}'
+                  - !Sub 'arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:pipeline/${SageMakerPipeline}/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${DataBucket}-${AWS::AccountId}-${EnvironmentName}'
+                  - !Sub 'arn:aws:s3:::${DataBucket}-${AWS::AccountId}-${EnvironmentName}/*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt SageMakerExecutionRole.Arn
+
+  PipelineTriggerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-sagemaker-trigger'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt PipelineTriggerLambdaRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      Code:
+        S3Bucket: !Ref LambdaS3Bucket
+        S3Key: !Sub 'lambda/sagemaker-trigger-${EnvironmentName}.zip'
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref EnvironmentName
+          PIPELINE_NAME: !Ref SageMakerPipeline
+          PIPELINE_ARTIFACTS_BUCKET: !Sub '${PipelineArtifactsBucket}-${AWS::AccountId}-${EnvironmentName}'
+          DATA_BUCKET: !Sub '${DataBucketName}-${AWS::AccountId}-${EnvironmentName}'
+          SAGEMAKER_ROLE_ARN: !GetAtt SageMakerExecutionRole.Arn
+
+  LambdaEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      Enabled: true
+      EventSourceArn: !GetAtt TrainingTriggerQueue.Arn
+      FunctionName: !Ref PipelineTriggerLambda
+      MaximumBatchingWindowInSeconds: 0
+
+  # ============================================================
+  # CLOUDWATCH LOG GROUP
+  # ============================================================
+  PipelineTriggerLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Retain
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${PipelineTriggerLambda}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ============================================================
+  # SAGEMAKER EXECUTION ROLE
+  # ============================================================
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-sagemaker-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+      Policies:
+        - PolicyName: SageMakerS3Policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${DataBucket}-${AWS::AccountId}-${EnvironmentName}'
+                  - !Sub 'arn:aws:s3:::${DataBucket}-${AWS::AccountId}-${EnvironmentName}/*'
+                  - !Sub 'arn:aws:s3:::${PipelineArtifactsBucket}-${AWS::AccountId}-${EnvironmentName}'
+                  - !Sub 'arn:aws:s3:::${PipelineArtifactsBucket}-${AWS::AccountId}-${EnvironmentName}/*'
+              - Effect: Allow
+                Action:
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:BatchCheckLayerAvailability
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # ============================================================
+  # SAGEMAKER PIPELINE
+  # ============================================================
+  SageMakerPipeline:
+    Type: AWS::SageMaker::Pipeline
+    Properties:
+      PipelineName: !Sub '${EnvironmentName}-${ModelName}-pipeline'
+      PipelineDescription: !Sub >
+        End-to-end ML pipeline for ${ModelName}.
+        Triggered by new data in S3. Steps: processing → training → evaluation → registration.
+      PipelineDefinition:
+        # The pipeline definition is stored in S3 and referenced here.
+        # The actual pipeline JSON is in pipeline/pipeline_definition.py
+        # and is uploaded during CI/CD deployment.
+        S3Location: !Sub 's3://${PipelineArtifactsBucket}-${AWS::AccountId}-${EnvironmentName}/pipeline/pipeline-definition.json'
+      RoleArn: !GetAtt SageMakerExecutionRole.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Model
+          Value: !Ref ModelName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================
+  # GITHUB OIDC ROLE FOR DEPLOYMENT
+  # ============================================================
+  GithubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-github-deploy-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub 'arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Sub 'repo:${GithubRepoOwner}/${GithubRepoName}:*'
+      Policies:
+        - PolicyName: DeployPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:*
+                  - s3:*
+                  - lambda:*
+                  - sqs:*
+                  - sagemaker:*
+                  - iam:PassRole
+                  - iam:GetRole
+                  - iam:CreateRole
+                  - iam:PutRolePolicy
+                  - iam:AttachRolePolicy
+                  - logs:*
+                  - ecr:*
+                Resource: '*'
+
+  # ============================================================
+  # OUTPUTS
+  # ============================================================
+Outputs:
+  DataBucketName:
+    Description: S3 bucket for training data uploads
+    Value: !Ref DataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DataBucket'
+
+  PipelineArtifactsBucketName:
+    Description: S3 bucket for pipeline artifacts
+    Value: !Ref PipelineArtifactsBucketResource
+    Export:
+      Name: !Sub '${AWS::StackName}-PipelineArtifactsBucket'
+
+  TrainingTriggerQueueUrl:
+    Description: SQS queue URL for training triggers
+    Value: !Ref TrainingTriggerQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-TrainingTriggerQueueUrl'
+
+  PipelineTriggerLambdaArn:
+    Description: Lambda function ARN for triggering pipeline
+    Value: !GetAtt PipelineTriggerLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PipelineTriggerLambdaArn'
+
+  SageMakerPipelineName:
+    Description: SageMaker pipeline name
+    Value: !Ref SageMakerPipeline
+    Export:
+      Name: !Sub '${AWS::StackName}-SageMakerPipelineName'
+
+  SageMakerExecutionRoleArn:
+    Description: IAM role ARN for SageMaker execution
+    Value: !GetAtt SageMakerExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SageMakerExecutionRoleArn'
+
+  GithubDeployRoleArn:
+    Description: IAM role ARN for GitHub Actions deployment
+    Value: !GetAtt GithubDeployRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-GithubDeployRoleArn'

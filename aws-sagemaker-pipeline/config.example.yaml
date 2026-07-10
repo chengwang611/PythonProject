@@ -1,0 +1,34 @@
+# AWS SageMaker ML Pipeline - Deployment Configuration
+# Copy this file to config.$(ENVIRONMENT).yaml and fill in values
+
+environment: dev
+aws_region: us-east-1
+model_name: customer-churn-model
+
+# S3 Buckets (suffixes - account ID and environment will be appended)
+data_bucket_name: my-sagemaker-data
+pipeline_artifacts_bucket: my-sagemaker-artifacts
+lambda_artifacts_bucket: my-sagemaker-lambda-artifacts
+cfn_templates_bucket: my-sagemaker-cfn-templates
+
+# SageMaker Training Configuration
+training_instance_type: ml.m5.xlarge
+training_instance_count: 1
+processing_instance_type: ml.m5.xlarge
+inference_instance_type: ml.m5.large
+inference_instance_count: 1
+
+# Lambda Configuration
+lambda_memory_size: 256
+lambda_timeout: 120
+
+# SQS Configuration
+sqs_visibility_timeout: 300
+sqs_delay_seconds: 0
+
+# Monitoring
+log_retention_days: 30
+
+# GitHub Repository (for OIDC deployment role)
+github_repo_owner: your-github-org
+github_repo_name: your-repo-name
