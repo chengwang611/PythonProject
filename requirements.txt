@@ -6,3 +6,4 @@ boto3
 requests
 aws-cdk-lib
 constructs
+aws-glue
