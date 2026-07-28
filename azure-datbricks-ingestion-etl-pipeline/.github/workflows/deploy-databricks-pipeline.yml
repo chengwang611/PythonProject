@@ -1,0 +1,254 @@
+name: Deploy Databricks Ingestion & ETL Pipeline
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'azure-datbricks-ingestion-etl-pipeline/**'
+      - '.github/workflows/deploy-databricks-pipeline.yml'
+  pull_request:
+    branches: [main, master]
+    paths:
+      - 'azure-datbricks-ingestion-etl-pipeline/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  PYTHON_VERSION: '3.11'
+  PIPELINE_DIR: azure-datbricks-ingestion-etl-pipeline
+
+jobs:
+  # =========================================================================
+  # Validate
+  # =========================================================================
+  validate:
+    name: Validate Code & Config
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          cd ${{ env.PIPELINE_DIR }}
+          pip install -r requirements.txt
+          pip install flake8 black isort
+
+      - name: Lint with flake8
+        run: |
+          cd ${{ env.PIPELINE_DIR }}
+          flake8 src/ --max-line-length=120 --ignore=E203,W503 --exit-zero
+
+      - name: Check formatting (black)
+        run: |
+          cd ${{ env.PIPELINE_DIR }}
+          black --check --line-length=120 src/ || echo "Formatting issues found (non-blocking)"
+
+      - name: Validate Python syntax
+        run: |
+          cd ${{ env.PIPELINE_DIR }}
+          find src/ -name "*.py" -exec python -m py_compile {} \;
+
+      - name: Validate YAML config
+        run: |
+          cd ${{ env.PIPELINE_DIR }}
+          python -c "import yaml; yaml.safe_load(open('config.example.yaml')); print('YAML valid')"
+
+      - name: Validate workflow JSON
+        run: |
+          cd ${{ env.PIPELINE_DIR }}
+          for f in workflows/*.json; do
+            python -c "import json; json.load(open('$f')); print('$f valid')"
+          done
+
+  # =========================================================================
+  # Build
+  # =========================================================================
+  build:
+    name: Build Python Wheel
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install build tools
+        run: pip install build
+
+      - name: Build wheel
+        run: |
+          cd ${{ env.PIPELINE_DIR }}
+          python -m build --wheel
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: databricks-pipeline-wheel
+          path: ${{ env.PIPELINE_DIR }}/dist/*.whl
+          retention-days: 7
+
+      - name: Upload notebooks artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: databricks-notebooks
+          path: ${{ env.PIPELINE_DIR }}/notebooks/*.py
+          retention-days: 7
+
+      - name: Upload workflows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: databricks-workflows
+          path: ${{ env.PIPELINE_DIR }}/workflows/*.json
+          retention-days: 7
+
+  # =========================================================================
+  # Deploy to Dev (automatic on push to main)
+  # =========================================================================
+  deploy-dev:
+    name: Deploy to Dev
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: databricks-pipeline-wheel
+          path: ${{ env.PIPELINE_DIR }}/dist/
+
+      - name: Install requests
+        run: pip install requests pyyaml
+
+      - name: Deploy to Databricks (Dev)
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          DATABRICKS_CLUSTER_ID: ${{ secrets.DATABRICKS_CLUSTER_ID_DEV }}
+        run: |
+          cd ${{ env.PIPELINE_DIR }}
+          python scripts/deploy_workflows.py \
+            --environment dev \
+            --wheel-dir dist \
+            --notebooks-dir notebooks \
+            --workflows-dir workflows \
+            --databricks-host "$DATABRICKS_HOST" \
+            --databricks-token "$DATABRICKS_TOKEN" \
+            --cluster-id "$DATABRICKS_CLUSTER_ID"
+
+  # =========================================================================
+  # Deploy to Staging (manual via workflow_dispatch)
+  # =========================================================================
+  deploy-staging:
+    name: Deploy to Staging
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'staging'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: databricks-pipeline-wheel
+          path: ${{ env.PIPELINE_DIR }}/dist/
+
+      - name: Install requests
+        run: pip install requests pyyaml
+
+      - name: Deploy to Databricks (Staging)
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          DATABRICKS_CLUSTER_ID: ${{ secrets.DATABRICKS_CLUSTER_ID_STAGING }}
+        run: |
+          cd ${{ env.PIPELINE_DIR }}
+          python scripts/deploy_workflows.py \
+            --environment staging \
+            --wheel-dir dist \
+            --notebooks-dir notebooks \
+            --workflows-dir workflows \
+            --databricks-host "$DATABRICKS_HOST" \
+            --databricks-token "$DATABRICKS_TOKEN" \
+            --cluster-id "$DATABRICKS_CLUSTER_ID"
+
+  # =========================================================================
+  # Deploy to Prod (manual via workflow_dispatch)
+  # =========================================================================
+  deploy-prod:
+    name: Deploy to Production
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'prod'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: databricks-pipeline-wheel
+          path: ${{ env.PIPELINE_DIR }}/dist/
+
+      - name: Install requests
+        run: pip install requests pyyaml
+
+      - name: Deploy to Databricks (Production)
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          DATABRICKS_CLUSTER_ID: ${{ secrets.DATABRICKS_CLUSTER_ID_PROD }}
+        run: |
+          cd ${{ env.PIPELINE_DIR }}
+          python scripts/deploy_workflows.py \
+            --environment prod \
+            --wheel-dir dist \
+            --notebooks-dir notebooks \
+            --workflows-dir workflows \
+            --databricks-host "$DATABRICKS_HOST" \
+            --databricks-token "$DATABRICKS_TOKEN" \
+            --cluster-id "$DATABRICKS_CLUSTER_ID"

@@ -1,0 +1,124 @@
+# =============================================================================
+# Databricks Asset Bundle — Ingestion & ETL Pipeline
+# =============================================================================
+# Deploy with: databricks bundle deploy -t <target>
+#   databricks bundle deploy -t dev
+#   databricks bundle deploy -t prod
+#
+# Prerequisites:
+#   1. Install Databricks CLI: https://docs.databricks.com/en/dev-tools/cli/install.html
+#   2. Authenticate: databricks configure --profile <profile-name>
+#   3. Validate: databricks bundle validate
+# =============================================================================
+
+bundle:
+  name: ingestion-etl-pipeline
+  # Databricks CLI will auto-generate a unique deployment ID per target
+
+# ---------------------------------------------------------------------------
+# Workspace paths (relative to bundle root)
+# ---------------------------------------------------------------------------
+workspace:
+  root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+
+# ---------------------------------------------------------------------------
+# Artifacts — notebooks and Python wheel
+# ---------------------------------------------------------------------------
+artifacts:
+  default:
+    type: whl
+    path: .
+    build: python3 setup.py bdist_wheel
+
+# ---------------------------------------------------------------------------
+# Resources — jobs (workflows)
+# ---------------------------------------------------------------------------
+resources:
+  jobs:
+    # Import job definitions from resources/*.job.yml
+    daily_ingestion_etl_pipeline:
+      ${include: ./resources/daily_ingestion_etl_pipeline.job.yml}
+
+    etl_only_pipeline:
+      ${include: ./resources/etl_only_pipeline.job.yml}
+
+# ---------------------------------------------------------------------------
+# Targets — per-environment overrides
+# ---------------------------------------------------------------------------
+targets:
+  dev:
+    default: true
+    workspace:
+      host: ${var.databricks_host}
+      root_path: /Workspace/Shared/.bundle/${bundle.name}/dev
+    run_as:
+      service_principal_name: ${var.sp_name_dev}
+    variables:
+      environment: dev
+      cluster_id: ${var.cluster_id_dev}
+      email_notifications: "data-team-dev@example.com"
+
+  staging:
+    workspace:
+      host: ${var.databricks_host}
+      root_path: /Workspace/Shared/.bundle/${bundle.name}/staging
+    run_as:
+      service_principal_name: ${var.sp_name_staging}
+    variables:
+      environment: staging
+      cluster_id: ${var.cluster_id_staging}
+      email_notifications: "data-team-staging@example.com"
+
+  prod:
+    workspace:
+      host: ${var.databricks_host}
+      root_path: /Workspace/Shared/.bundle/${bundle.name}/prod
+    run_as:
+      service_principal_name: ${var.sp_name_prod}
+    variables:
+      environment: prod
+      cluster_id: ${var.cluster_id_prod}
+      email_notifications: "data-team@example.com"
+
+# ---------------------------------------------------------------------------
+# Variables — resolved from environment or Databricks CLI profiles
+# ---------------------------------------------------------------------------
+variables:
+  databricks_host:
+    description: "Databricks workspace URL"
+    type: string
+
+  # Dev
+  sp_name_dev:
+    description: "Service principal name for dev"
+    type: string
+  cluster_id_dev:
+    description: "Cluster ID for dev"
+    type: string
+
+  # Staging
+  sp_name_staging:
+    description: "Service principal name for staging"
+    type: string
+  cluster_id_staging:
+    description: "Cluster ID for staging"
+    type: string
+
+  # Prod
+  sp_name_prod:
+    description: "Service principal name for prod"
+    type: string
+  cluster_id_prod:
+    description: "Cluster ID for prod"
+    type: string
+
+  # Shared
+  environment:
+    description: "Deployment environment tag"
+    type: string
+  cluster_id:
+    description: "Target cluster ID"
+    type: string
+  email_notifications:
+    description: "Email for job failure notifications"
+    type: string

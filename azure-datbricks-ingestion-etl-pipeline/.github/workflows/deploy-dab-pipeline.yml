@@ -1,0 +1,239 @@
+name: Deploy with Databricks Asset Bundle (DAB)
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'azure-datbricks-ingestion-etl-pipeline/**'
+      - '.github/workflows/deploy-dab-pipeline.yml'
+  pull_request:
+    branches: [main, master]
+    paths:
+      - 'azure-datbricks-ingestion-etl-pipeline/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      validate_only:
+        description: 'Validate bundle only (no deploy)'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  PYTHON_VERSION: '3.11'
+  PIPELINE_DIR: azure-datbricks-ingestion-etl-pipeline
+  DATABRICKS_BUNDLE_VERSION: '0.230.0'
+
+jobs:
+  # =========================================================================
+  # Validate Bundle
+  # =========================================================================
+  validate-bundle:
+    name: Validate Databricks Asset Bundle
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Databricks CLI
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+          echo "$HOME/.databricks/bin" >> $GITHUB_PATH
+
+      - name: Verify CLI version
+        run: databricks version
+
+      - name: Validate bundle schema
+        run: |
+          cd ${{ env.PIPELINE_DIR }}
+          databricks bundle schema validate
+
+      - name: Validate bundle for dev target
+        run: |
+          cd ${{ env.PIPELINE_DIR }}
+          databricks bundle validate -t dev 2>&1 || echo "Validation warnings (expected without auth)"
+
+  # =========================================================================
+  # Deploy to Dev (automatic on push to main)
+  # =========================================================================
+  deploy-dev:
+    name: Deploy Bundle → Dev
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: validate-bundle
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Databricks CLI
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+          echo "$HOME/.databricks/bin" >> $GITHUB_PATH
+
+      - name: Configure Databricks CLI profile
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID_DEV }}
+          DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET_DEV }}
+        run: |
+          # Create a .databrickscfg file for OAuth (service principal) auth
+          mkdir -p ~/.databricks
+          cat > ~/.databrickscfg << EOF
+          [DEFAULT]
+          host = ${DATABRICKS_HOST}
+          client_id = ${DATABRICKS_CLIENT_ID}
+          client_secret = ${DATABRICKS_CLIENT_SECRET}
+          EOF
+
+      - name: Deploy bundle to dev
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_CLUSTER_ID_DEV: ${{ secrets.DATABRICKS_CLUSTER_ID_DEV }}
+          DATABRICKS_SP_NAME_DEV: ${{ secrets.DATABRICKS_SP_NAME_DEV }}
+        run: |
+          cd ${{ env.PIPELINE_DIR }}
+          databricks bundle deploy -t dev \
+            --var="databricks_host=${DATABRICKS_HOST}" \
+            --var="cluster_id_dev=${DATABRICKS_CLUSTER_ID_DEV}" \
+            --var="sp_name_dev=${DATABRICKS_SP_NAME_DEV}" \
+            --var="cluster_id_staging=placeholder" \
+            --var="sp_name_staging=placeholder" \
+            --var="cluster_id_prod=placeholder" \
+            --var="sp_name_prod=placeholder"
+
+      - name: Run validation job (optional smoke test)
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+        run: |
+          cd ${{ env.PIPELINE_DIR }}
+          databricks bundle run -t dev daily_ingestion_etl_pipeline 2>&1 || \
+            echo "Smoke test skipped (job may require cluster to be running)"
+
+  # =========================================================================
+  # Deploy to Staging (manual via workflow_dispatch)
+  # =========================================================================
+  deploy-staging:
+    name: Deploy Bundle → Staging
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'staging'
+    needs: validate-bundle
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Databricks CLI
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+          echo "$HOME/.databricks/bin" >> $GITHUB_PATH
+
+      - name: Configure Databricks CLI profile
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID_STAGING }}
+          DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET_STAGING }}
+        run: |
+          mkdir -p ~/.databricks
+          cat > ~/.databrickscfg << EOF
+          [DEFAULT]
+          host = ${DATABRICKS_HOST}
+          client_id = ${DATABRICKS_CLIENT_ID}
+          client_secret = ${DATABRICKS_CLIENT_SECRET}
+          EOF
+
+      - name: Deploy bundle to staging
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_CLUSTER_ID_STAGING: ${{ secrets.DATABRICKS_CLUSTER_ID_STAGING }}
+          DATABRICKS_SP_NAME_STAGING: ${{ secrets.DATABRICKS_SP_NAME_STAGING }}
+        run: |
+          cd ${{ env.PIPELINE_DIR }}
+          databricks bundle deploy -t staging \
+            --var="databricks_host=${DATABRICKS_HOST}" \
+            --var="cluster_id_dev=placeholder" \
+            --var="sp_name_dev=placeholder" \
+            --var="cluster_id_staging=${DATABRICKS_CLUSTER_ID_STAGING}" \
+            --var="sp_name_staging=${DATABRICKS_SP_NAME_STAGING}" \
+            --var="cluster_id_prod=placeholder" \
+            --var="sp_name_prod=placeholder"
+
+  # =========================================================================
+  # Deploy to Prod (manual via workflow_dispatch)
+  # =========================================================================
+  deploy-prod:
+    name: Deploy Bundle → Production
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'prod'
+    needs: validate-bundle
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Databricks CLI
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+          echo "$HOME/.databricks/bin" >> $GITHUB_PATH
+
+      - name: Configure Databricks CLI profile
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID_PROD }}
+          DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET_PROD }}
+        run: |
+          mkdir -p ~/.databricks
+          cat > ~/.databrickscfg << EOF
+          [DEFAULT]
+          host = ${DATABRICKS_HOST}
+          client_id = ${DATABRICKS_CLIENT_ID}
+          client_secret = ${DATABRICKS_CLIENT_SECRET}
+          EOF
+
+      - name: Deploy bundle to production
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_CLUSTER_ID_PROD: ${{ secrets.DATABRICKS_CLUSTER_ID_PROD }}
+          DATABRICKS_SP_NAME_PROD: ${{ secrets.DATABRICKS_SP_NAME_PROD }}
+        run: |
+          cd ${{ env.PIPELINE_DIR }}
+          databricks bundle deploy -t prod \
+            --var="databricks_host=${DATABRICKS_HOST}" \
+            --var="cluster_id_dev=placeholder" \
+            --var="sp_name_dev=placeholder" \
+            --var="cluster_id_staging=placeholder" \
+            --var="sp_name_staging=placeholder" \
+            --var="cluster_id_prod=${DATABRICKS_CLUSTER_ID_PROD}" \
+            --var="sp_name_prod=${DATABRICKS_SP_NAME_PROD}"

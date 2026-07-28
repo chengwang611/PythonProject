@@ -1,0 +1,99 @@
+{
+  "name": "daily-ingestion-etl-pipeline",
+  "description": "Daily data ingestion from Salesforce & PMM, followed by ETL to silver Delta tables",
+  "schedule": {
+    "quartz_cron_expression": "0 0 2 * * ?",
+    "timezone_id": "UTC",
+    "pause_status": "UNPAUSED"
+  },
+  "max_concurrent_runs": 1,
+  "tasks": [
+    {
+      "task_key": "salesforce_ingestion",
+      "description": "Extract Salesforce data via Bulk API 2.0 and save as Parquet to raw layer",
+      "depends_on": [],
+      "existing_cluster_id": "{{DATABRICKS_CLUSTER_ID}}",
+      "notebook_task": {
+        "notebook_path": "/Workspace/Shared/notebooks/salesforce_ingestion",
+        "base_parameters": {
+          "config_path": "/Workspace/Shared/pipeline_config.yaml",
+          "trade_date": "{{job.parameter.trade_date}}"
+        },
+        "source": "WORKSPACE"
+      },
+      "timeout_seconds": 3600,
+      "max_retries": 3,
+      "min_retry_interval_millis": 300000,
+      "retry_on_timeout": true,
+      "email_notifications": {
+        "on_failure": ["data-team@example.com"],
+        "on_duration_warning_threshold_exceeded": ["data-team@example.com"]
+      }
+    },
+    {
+      "task_key": "pmm_ingestion",
+      "description": "Extract PMM data via REST API and save as Parquet to raw layer",
+      "depends_on": [],
+      "existing_cluster_id": "{{DATABRICKS_CLUSTER_ID}}",
+      "notebook_task": {
+        "notebook_path": "/Workspace/Shared/notebooks/pmm_ingestion",
+        "base_parameters": {
+          "config_path": "/Workspace/Shared/pipeline_config.yaml",
+          "trade_date": "{{job.parameter.trade_date}}"
+        },
+        "source": "WORKSPACE"
+      },
+      "timeout_seconds": 3600,
+      "max_retries": 3,
+      "min_retry_interval_millis": 300000,
+      "retry_on_timeout": true,
+      "email_notifications": {
+        "on_failure": ["data-team@example.com"],
+        "on_duration_warning_threshold_exceeded": ["data-team@example.com"]
+      }
+    },
+    {
+      "task_key": "etl_pipeline",
+      "description": "Read raw Parquet, validate, filter, join, aggregate, and write to silver Delta tables",
+      "depends_on": [
+        {
+          "task_key": "salesforce_ingestion",
+          "outcome": "success"
+        },
+        {
+          "task_key": "pmm_ingestion",
+          "outcome": "success"
+        }
+      ],
+      "existing_cluster_id": "{{DATABRICKS_CLUSTER_ID}}",
+      "notebook_task": {
+        "notebook_path": "/Workspace/Shared/notebooks/etl_pipeline",
+        "base_parameters": {
+          "config_path": "/Workspace/Shared/pipeline_config.yaml",
+          "trade_date": "{{job.parameter.trade_date}}"
+        },
+        "source": "WORKSPACE"
+      },
+      "timeout_seconds": 7200,
+      "max_retries": 2,
+      "min_retry_interval_millis": 300000,
+      "retry_on_timeout": true,
+      "email_notifications": {
+        "on_failure": ["data-team@example.com"],
+        "on_duration_warning_threshold_exceeded": ["data-team@example.com"]
+      }
+    }
+  ],
+  "parameters": [
+    {
+      "name": "trade_date",
+      "default": "{{yesterday}}"
+    }
+  ],
+  "tags": {
+    "project": "databricks-ingestion-etl",
+    "environment": "{{ENVIRONMENT}}",
+    "managed_by": "github-actions"
+  },
+  "format": "MULTI_TASK"
+}

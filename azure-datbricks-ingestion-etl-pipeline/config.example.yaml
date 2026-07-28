@@ -1,0 +1,82 @@
+# =============================================================================
+# Azure Databricks Ingestion & ETL Pipeline — Configuration
+# =============================================================================
+# Copy this file to config.yaml and fill in your values.
+# Sensitive values (passwords, keys) should be stored in Databricks Secrets
+# and referenced via the secret_scope fields below.
+# =============================================================================
+
+environment: dev
+
+# ---------------------------------------------------------------------------
+# Storage (ADLS Gen2)
+# ---------------------------------------------------------------------------
+storage:
+  storage_account: "yourstorageaccount"
+  raw_container: "raw"
+  # raw_base_path is auto-computed; override if using DBFS mount
+  # raw_base_path: "/mnt/datalake"
+
+# ---------------------------------------------------------------------------
+# Salesforce Connection
+# ---------------------------------------------------------------------------
+salesforce:
+  instance_url: "https://your-instance.salesforce.com"
+  api_version: "v58.0"
+  # Credentials — store in Databricks Secrets scope "salesforce-secrets"
+  # Keys: client_id, client_secret, username, password, security_token
+  secret_scope: "salesforce-secrets"
+  # Objects to extract daily
+  objects:
+    - Account
+    - Contact
+    - Opportunity
+    - CustomObject__c
+
+# ---------------------------------------------------------------------------
+# PMM REST API
+# ---------------------------------------------------------------------------
+pmm:
+  base_url: "https://api.pmm.example.com"
+  # API key — store in Databricks Secrets scope "pmm-secrets"
+  # Key: api_key
+  secret_scope: "pmm-secrets"
+  endpoints:
+    - /v1/metrics
+    - /v1/transactions
+    - /v1/positions
+  page_size: 1000
+  max_pages: 500
+
+# ---------------------------------------------------------------------------
+# Unity Catalog
+# ---------------------------------------------------------------------------
+unity_catalog:
+  catalog: "main"
+  silver_schema: "silver"
+  gold_schema: "gold"
+
+# ---------------------------------------------------------------------------
+# ETL Settings
+# ---------------------------------------------------------------------------
+etl:
+  # trade_date: "2026-01-01"   # Override; defaults to yesterday
+  validation_mode: "warn"       # "strict" raises on violation, "warn" logs only
+  null_threshold_pct: 10.0
+  dedup_keys:
+    - id
+    - trade_date
+  join_keys:
+    - account_id
+    - trade_date
+  aggregation_columns:
+    total_amount: "sum(amount)"
+    avg_price: "avg(price)"
+  silver_tables:
+    - salesforce_account
+    - salesforce_contact
+    - salesforce_opportunity
+    - pmm_v1_metrics
+    - pmm_v1_transactions
+    - pmm_v1_positions
+    - joined_salesforce_pmm

@@ -1,0 +1,257 @@
+# Azure Databricks Ingestion & ETL Pipeline
+
+A production-grade **medallion architecture** (Bronze → Silver → Gold) data pipeline on Azure Databricks that ingests data from **Salesforce** (Bulk API 2.0) and **PMM** (REST API), transforms it, and writes curated Delta tables managed by **Unity Catalog**.
+
+## Architecture
+
+```
+Salesforce (Bulk API) ──┐
+                         ├──► Raw Layer (Parquet) ──► Silver Layer (Delta + Unity Catalog)
+PMM (REST API) ─────────┘
+```
+
+| Layer   | Format        | Storage          | Catalog            |
+|---------|---------------|------------------|--------------------|
+| Raw     | Parquet       | ADLS Gen2 / DBFS | N/A                |
+| Silver  | Delta Table   | ADLS Gen2        | Unity Catalog      |
+| Gold    | Delta Table   | ADLS Gen2        | Unity Catalog (TBD)|
+
+## Project Structure
+
+```
+azure-datbricks-ingestion-etl-pipeline/
+├── DESIGN.md                    # Architecture design document
+├── README.md                    # This file
+├── Makefile                     # Local dev & deploy commands
+├── requirements.txt             # Python dependencies
+├── setup.py                     # Wheel packaging
+├── config.example.yaml          # Configuration template
+├── databricks.yml               # Databricks Asset Bundle (DAB) root config
+│
+├── src/
+│   ├── config.py                # Configuration loader (YAML + Databricks Secrets)
+│   ├── ingestion/
+│   │   ├── auth.py              # OAuth2 & API-key authentication
+│   │   ├── base_rest.py         # Generic REST pagination client
+│   │   ├── salesforce_bulk.py   # Salesforce Bulk API 2.0 client
+│   │   └── pmm_api.py           # PMM REST API client
+│   ├── raw_writer/
+│   │   └── parquet_writer.py    # Parquet writer for raw (bronze) layer
+│   ├── etl/
+│   │   ├── validator.py         # Schema & data quality validation
+│   │   ├── transformer.py       # Filter, join, aggregation logic
+│   │   └── delta_writer.py      # Delta table writer with Unity Catalog
+│   └── utils/
+│       ├── spark_utils.py       # Spark session builder
+│       └── logging_utils.py     # Logging configuration
+│
+├── notebooks/
+│   ├── salesforce_ingestion.py  # Databricks notebook: SF → Raw
+│   ├── pmm_ingestion.py         # Databricks notebook: PMM → Raw
+│   └── etl_pipeline.py          # Databricks notebook: Raw → Silver
+│
+├── resources/                   # DAB job definitions
+│   ├── daily_ingestion_etl_pipeline.job.yml
+│   └── etl_only_pipeline.job.yml
+│
+├── workflows/                   # Legacy JSON workflow definitions
+│   ├── ingestion_workflow.json
+│   └── etl_workflow.json
+│
+├── scripts/
+│   └── deploy_workflows.py      # Databricks REST API deployment script (legacy)
+│
+└── .github/
+    └── workflows/
+        ├── deploy-databricks-pipeline.yml  # CI/CD (REST API — legacy)
+        └── deploy-dab-pipeline.yml         # CI/CD (DAB — recommended)
+```
+
+## Prerequisites
+
+- **Azure Databricks** workspace with Unity Catalog enabled
+- **ADLS Gen2** storage account for raw data
+- **Databricks cluster** with:
+  - Runtime: 14.3 LTS or later
+  - Spark config with Delta Lake and Unity Catalog support
+- **Databricks Secrets** configured:
+  - Scope `salesforce-secrets`: `client_id`, `client_secret`, `username`, `password`, `security_token`
+  - Scope `pmm-secrets`: `api_key`
+- **Databricks CLI** (for DAB deployment):
+  ```bash
+  # macOS / Linux
+  curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+  
+  # Or use make
+  make dab-cli-install
+  ```
+- **GitHub Secrets** (for CI/CD):
+  - `DATABRICKS_HOST` — workspace URL
+  - `DATABRICKS_TOKEN` — personal access token (legacy REST API)
+  - `DATABRICKS_CLIENT_ID_DEV` / `_STAGING` / `_PROD` — service principal client ID (DAB)
+  - `DATABRICKS_CLIENT_SECRET_DEV` / `_STAGING` / `_PROD` — service principal secret (DAB)
+  - `DATABRICKS_CLUSTER_ID_DEV` / `_STAGING` / `_PROD`
+  - `DATABRICKS_SP_NAME_DEV` / `_STAGING` / `_PROD` — service principal name (DAB)
+
+## Quick Start
+
+### 1. Clone & Configure
+
+```bash
+git clone <repo-url>
+cd azure-datbricks-ingestion-etl-pipeline
+
+# Copy and edit configuration
+cp config.example.yaml config.yaml
+# Fill in your storage account, Salesforce instance, PMM URL, etc.
+```
+
+### 2. Install Dependencies
+
+```bash
+make deps
+```
+
+### 3. Build the Wheel
+
+```bash
+make build
+```
+
+### 4. Deploy to Databricks
+
+Two deployment methods are available:
+
+#### Method A: Databricks Asset Bundle (DAB) — **Recommended**
+
+DAB provides declarative, infrastructure-as-code deployment with built-in validation, diffing, and rollback support.
+
+```bash
+# 1. Authenticate with Databricks CLI (OAuth for service principals)
+databricks auth login --host https://adb-xxxxx.xx.azuredatabricks.net
+
+# 2. Validate the bundle
+make dab-validate
+
+# 3. Deploy to dev
+export DATABRICKS_HOST="https://adb-xxxxx.xx.azuredatabricks.net"
+export DATABRICKS_CLUSTER_ID_DEV="xxxx-xxxxxx-xxxxxxxx"
+export DATABRICKS_SP_NAME_DEV="your-sp-name"
+
+make dab-deploy-dev
+
+# 4. Run the pipeline
+ENVIRONMENT=dev make dab-run
+```
+
+#### Method B: REST API (Legacy)
+
+```bash
+export DATABRICKS_HOST="https://adb-xxxxx.xx.azuredatabricks.net"
+export DATABRICKS_TOKEN="dapi..."
+export DATABRICKS_CLUSTER_ID="xxxx-xxxxxx-xxxxxxxx"
+
+make deploy-dev
+```
+
+### 5. Run a Pipeline Manually
+
+**Via DAB CLI:**
+```bash
+ENVIRONMENT=dev make dab-run
+```
+
+**Via Databricks UI:**
+1. Go to **Workflows** → find `daily-ingestion-etl-pipeline`
+2. Click **Run now** with parameters: `trade_date = "2026-07-27"`
+
+## Databricks Asset Bundle (DAB) Details
+
+### Bundle Structure
+
+| File | Purpose |
+|------|---------|
+| [`databricks.yml`](databricks.yml) | Root bundle config — targets, variables, workspace paths |
+| [`resources/daily_ingestion_etl_pipeline.job.yml`](resources/daily_ingestion_etl_pipeline.job.yml) | Multi-task job: SF + PMM ingestion → ETL |
+| [`resources/etl_only_pipeline.job.yml`](resources/etl_only_pipeline.job.yml) | Standalone ETL job |
+
+### Bundle Commands
+
+```bash
+# Validate
+databricks bundle validate -t dev
+
+# Deploy (creates/updates all resources)
+databricks bundle deploy -t dev
+
+# Run a specific job
+databricks bundle run -t dev daily_ingestion_etl_pipeline
+
+# See what would change (dry-run)
+databricks bundle deploy -t dev --dry-run
+
+# Destroy all deployed resources
+databricks bundle destroy -t dev
+```
+
+### Target Environments
+
+| Target | Workspace Path | Trigger |
+|--------|---------------|---------|
+| `dev` | `/Workspace/Shared/.bundle/ingestion-etl-pipeline/dev` | Auto on push to `main` |
+| `staging` | `/Workspace/Shared/.bundle/ingestion-etl-pipeline/staging` | Manual via workflow_dispatch |
+| `prod` | `/Workspace/Shared/.bundle/ingestion-etl-pipeline/prod` | Manual via workflow_dispatch |
+
+## Configuration
+
+All configuration is in [`config.example.yaml`](config.example.yaml). Sensitive values are stored in **Databricks Secrets** and referenced via `secret_scope`.
+
+| Secret Scope          | Keys                                                    |
+|-----------------------|---------------------------------------------------------|
+| `salesforce-secrets`  | `client_id`, `client_secret`, `username`, `password`, `security_token` |
+| `pmm-secrets`         | `api_key`                                               |
+
+## CI/CD Pipelines
+
+Two GitHub Actions workflows are provided:
+
+### 1. DAB Pipeline (Recommended) — [`.github/workflows/deploy-dab-pipeline.yml`](.github/workflows/deploy-dab-pipeline.yml)
+
+| Stage | Trigger | Description |
+|-------|---------|-------------|
+| **Validate** | Every push/PR | Validates bundle schema and syntax |
+| **Deploy Dev** | Push to `main` | `databricks bundle deploy -t dev` |
+| **Deploy Staging** | Manual (`workflow_dispatch`) | `databricks bundle deploy -t staging` |
+| **Deploy Prod** | Manual (`workflow_dispatch`) | `databricks bundle deploy -t prod` |
+
+Uses OAuth (service principal) authentication — no PAT tokens needed.
+
+### 2. REST API Pipeline (Legacy) — [`.github/workflows/deploy-databricks-pipeline.yml`](.github/workflows/deploy-databricks-pipeline.yml)
+
+| Stage | Trigger | Description |
+|-------|---------|-------------|
+| **Validate** | Every push/PR | Lint, syntax check, YAML/JSON validation |
+| **Build** | After validate | Creates Python wheel, uploads as artifact |
+| **Deploy Dev** | Push to `main` | Uploads wheel + notebooks + creates workflows via REST API |
+| **Deploy Staging/Prod** | Manual (`workflow_dispatch`) | Same as dev, targeting staging/prod |
+
+## Scheduling
+
+| Workflow                    | Schedule (UTC)     | Description                        |
+|-----------------------------|--------------------|------------------------------------|
+| `daily-ingestion-etl-pipeline` | 02:00 daily      | SF + PMM ingestion → ETL           |
+| `etl-only-pipeline`         | 04:00 daily        | Standalone ETL (Raw → Silver)      |
+
+## Development
+
+```bash
+make lint          # Run linters
+make format        # Auto-format code
+make test          # Run unit tests
+make validate      # Run all validations
+make dab-validate  # Validate DAB configuration
+```
+
+## License
+
+Proprietary — Internal use only.

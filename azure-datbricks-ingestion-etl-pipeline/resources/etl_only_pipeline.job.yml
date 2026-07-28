@@ -1,0 +1,49 @@
+# =============================================================================
+# Job: etl-only-pipeline
+# =============================================================================
+# Standalone ETL pipeline (Raw → Silver) — can be triggered independently
+# or used as a recovery job when ingestion already completed.
+# =============================================================================
+
+name: etl-only-pipeline
+description: "Standalone ETL pipeline (Raw → Silver) — can be triggered independently"
+
+schedule:
+  quartz_cron_expression: "0 0 4 * * ?"
+  timezone_id: UTC
+  pause_status: UNPAUSED
+
+max_concurrent_runs: 1
+
+parameters:
+  - name: trade_date
+    default: "{{yesterday}}"
+
+tags:
+  project: "databricks-ingestion-etl"
+  environment: ${var.environment}
+  managed_by: "databricks-asset-bundle"
+
+email_notifications:
+  on_failure:
+    - ${var.email_notifications}
+  on_duration_warning_threshold_exceeded:
+    - ${var.email_notifications}
+
+# ---------------------------------------------------------------------------
+# Tasks
+# ---------------------------------------------------------------------------
+tasks:
+  - task_key: etl_pipeline
+    description: "Read raw Parquet, validate, filter, join, aggregate, and write to silver Delta tables"
+    existing_cluster_id: ${var.cluster_id}
+    notebook_task:
+      notebook_path: ${workspace.root_path}/notebooks/etl_pipeline
+      source: WORKSPACE
+      base_parameters:
+        config_path: "/Workspace/Shared/pipeline_config.yaml"
+        trade_date: "{{job.parameter.trade_date}}"
+    timeout_seconds: 7200
+    max_retries: 2
+    min_retry_interval_millis: 300000
+    retry_on_timeout: true

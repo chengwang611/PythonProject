@@ -1,0 +1,20 @@
+# Core
+pyyaml>=6.0
+requests>=2.31.0
+
+# Databricks / Spark (provided by Databricks runtime — listed for local dev)
+pyspark>=3.5.0,<4.0.0
+delta-spark>=3.1.0
+
+# Salesforce (optional — for local testing)
+simple-salesforce>=1.12.0
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+
+# Linting & formatting (dev)
+flake8>=6.1.0
+black>=23.9.0
+isort>=5.12.0
+mypy>=1.5.0
