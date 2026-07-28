@@ -41,11 +41,15 @@ azure-datbricks-ingestion-etl-pipeline/
 │   │   ├── validator.py         # Schema & data quality validation
 │   │   ├── transformer.py       # Filter, join, aggregation logic
 │   │   └── delta_writer.py      # Delta table writer with Unity Catalog
+│   ├── entry_points/            # python_wheel_task entry points
+│   │   ├── salesforce_ingestion_entry.py
+│   │   ├── pmm_ingestion_entry.py
+│   │   └── etl_pipeline_entry.py
 │   └── utils/
 │       ├── spark_utils.py       # Spark session builder
 │       └── logging_utils.py     # Logging configuration
 │
-├── notebooks/
+├── notebooks/                   # notebook_task entry points
 │   ├── salesforce_ingestion.py  # Databricks notebook: SF → Raw
 │   ├── pmm_ingestion.py         # Databricks notebook: PMM → Raw
 │   └── etl_pipeline.py          # Databricks notebook: Raw → Silver
@@ -201,6 +205,56 @@ databricks bundle destroy -t dev
 | `dev` | `/Workspace/Shared/.bundle/ingestion-etl-pipeline/dev` | Auto on push to `main` |
 | `staging` | `/Workspace/Shared/.bundle/ingestion-etl-pipeline/staging` | Manual via workflow_dispatch |
 | `prod` | `/Workspace/Shared/.bundle/ingestion-etl-pipeline/prod` | Manual via workflow_dispatch |
+
+## Task Types: Notebook vs Python Wheel
+
+This project supports **two task execution modes** in Databricks Workflows. The DAB job YAMLs include both options — comment/uncomment to switch.
+
+| Feature | `notebook_task` (default) | `python_wheel_task` |
+|---------|---------------------------|---------------------|
+| Entry point | [`notebooks/`](notebooks/) | [`src/entry_points/`](src/entry_points/) |
+| Parameter passing | `dbutils.widgets` | `argparse` (CLI args) |
+| Interactive debugging | ✅ Cell-by-cell in UI | ❌ Logs only |
+| Local testing | ❌ Requires Databricks | ✅ `pytest` on laptop |
+| CI integration | ❌ Notebook-specific | ✅ Standard Python |
+| State isolation | ⚠️ Cells share state | ✅ Stateless function |
+
+**Switching in DAB YAML:**
+
+```yaml
+# -- Option A: notebook_task (default) --
+notebook_task:
+  notebook_path: ${workspace.root_path}/notebooks/salesforce_ingestion
+  source: WORKSPACE
+  base_parameters:
+    config_path: "/Workspace/Shared/pipeline_config.yaml"
+    trade_date: "{{job.parameter.trade_date}}"
+
+# -- Option B: python_wheel_task (uncomment to use) --
+# python_wheel_task:
+#   package_name: databricks_ingestion_etl_pipeline
+#   entry_point: entry_points.salesforce_ingestion_entry:main
+#   parameters:
+#     - "--config_path"
+#     - "/Workspace/Shared/pipeline_config.yaml"
+#     - "--trade_date"
+#     - "{{job.parameter.trade_date}}"
+```
+
+**Local testing with wheel tasks:**
+
+```bash
+# Build the wheel
+make build
+
+# Install it
+pip install dist/databricks_ingestion_etl_pipeline-1.0.0-py3-none-any.whl
+
+# Run locally (requires Spark)
+salesforce-ingestion --config_path config.yaml --trade_date 2026-07-27
+pmm-ingestion --config_path config.yaml --trade_date 2026-07-27
+etl-pipeline --config_path config.yaml --trade_date 2026-07-27
+```
 
 ## Configuration
 

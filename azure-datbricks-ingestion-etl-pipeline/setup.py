@@ -30,6 +30,10 @@ setup(
         "Operating System :: OS Independent",
     ],
     entry_points={
-        "console_scripts": [],
+        "console_scripts": [
+            "salesforce-ingestion=entry_points.salesforce_ingestion_entry:main",
+            "pmm-ingestion=entry_points.pmm_ingestion_entry:main",
+            "etl-pipeline=entry_points.etl_pipeline_entry:main",
+        ],
     },
 )

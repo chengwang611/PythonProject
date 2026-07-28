@@ -75,7 +75,7 @@ azure-datbricks-ingestion-etl-pipeline/
 ├── README.md                          # Setup & usage instructions
 ├── Makefile                           # Local dev & deploy commands
 ├── requirements.txt                   # Python dependencies
-├── setup.py                           # Wheel packaging
+├── setup.py                           # Wheel packaging (with console_scripts entry points)
 ├── config.example.yaml                # Configuration template
 ├── databricks.yml                     # Databricks Asset Bundle (DAB) root config
 │
@@ -100,12 +100,18 @@ azure-datbricks-ingestion-etl-pipeline/
 │   │   ├── transformer.py             # Filter, join, aggregation logic
 │   │   └── delta_writer.py            # Write to Delta tables with Unity Catalog
 │   │
+│   ├── entry_points/                  # python_wheel_task entry points
+│   │   ├── __init__.py
+│   │   ├── salesforce_ingestion_entry.py
+│   │   ├── pmm_ingestion_entry.py
+│   │   └── etl_pipeline_entry.py
+│   │
 │   └── utils/
 │       ├── __init__.py
 │       ├── spark_utils.py             # Spark session builder
 │       └── logging_utils.py           # Logging configuration
 │
-├── notebooks/
+├── notebooks/                         # notebook_task entry points
 │   ├── salesforce_ingestion.py        # Databricks notebook: SF → Raw
 │   ├── pmm_ingestion.py               # Databricks notebook: PMM → Raw
 │   └── etl_pipeline.py                # Databricks notebook: Raw → Silver
@@ -127,7 +133,62 @@ azure-datbricks-ingestion-etl-pipeline/
     └── deploy_workflows.py            # Databricks REST API deployment helper (legacy)
 ```
 
-## 5. Data Flow
+## 5. Task Execution: Notebook vs Python Wheel
+
+Databricks Workflows support two task types for running Python code. This project provides **both** so teams can choose based on their needs.
+
+### 5.1 `notebook_task` (default — interactive)
+
+- Uses `dbutils.widgets` for parameter passing
+- Produces cell-by-cell output in the Databricks UI
+- Supports interactive re-run of individual cells for debugging
+- Defined in [`notebooks/`](notebooks/) as Databricks notebook files
+
+### 5.2 `python_wheel_task` (alternative — stateless)
+
+- Uses `argparse` for CLI-style parameter passing
+- Runs as a plain Python function — no `dbutils` dependency
+- **Testable locally** with `pytest` without a Databricks runtime
+- **CI-friendly**: the same entry point can run in GitHub Actions for integration tests
+- Defined in [`src/entry_points/`](src/entry_points/) as standard Python modules
+- Registered as `console_scripts` in [`setup.py`](setup.py)
+
+### 5.3 Comparison
+
+| Feature | `notebook_task` | `python_wheel_task` |
+|---------|----------------|---------------------|
+| Parameter passing | `dbutils.widgets` | `argparse` (CLI args) |
+| Interactive debugging | ✅ Cell-by-cell in UI | ❌ Logs only |
+| Local testing | ❌ Requires Databricks | ✅ `pytest` on laptop |
+| CI integration | ❌ Notebook-specific | ✅ Standard Python |
+| State isolation | ⚠️ Cells share state | ✅ Stateless function |
+| UI output | ✅ Rich cell output | ⚠️ stdout only |
+
+### 5.4 Switching Between Task Types
+
+In the DAB job YAMLs ([`resources/daily_ingestion_etl_pipeline.job.yml`](resources/daily_ingestion_etl_pipeline.job.yml) and [`resources/etl_only_pipeline.job.yml`](resources/etl_only_pipeline.job.yml)), each task has both options. Comment out one block and uncomment the other:
+
+```yaml
+# -- Option A: notebook_task (default) --
+notebook_task:
+  notebook_path: ${workspace.root_path}/notebooks/salesforce_ingestion
+  source: WORKSPACE
+  base_parameters:
+    config_path: "/Workspace/Shared/pipeline_config.yaml"
+    trade_date: "{{job.parameter.trade_date}}"
+
+# -- Option B: python_wheel_task --
+# python_wheel_task:
+#   package_name: databricks_ingestion_etl_pipeline
+#   entry_point: entry_points.salesforce_ingestion_entry:main
+#   parameters:
+#     - "--config_path"
+#     - "/Workspace/Shared/pipeline_config.yaml"
+#     - "--trade_date"
+#     - "{{job.parameter.trade_date}}"
+```
+
+## 6. Data Flow
 
 ### 5.1 Salesforce Ingestion Flow
 ```

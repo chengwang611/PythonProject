@@ -36,16 +36,37 @@ email_notifications:
 # Tasks
 # ---------------------------------------------------------------------------
 tasks:
+  # =========================================================================
+  # Task type selection:
+  #   - notebook_task:   interactive debugging, cell-by-cell output in UI
+  #   - python_wheel_task: stateless, testable locally, CI-friendly
+  #
+  # To switch, comment out one block and uncomment the other.
+  # =========================================================================
+
   # --- Salesforce Ingestion ---
   - task_key: salesforce_ingestion
     description: "Extract Salesforce data via Bulk API 2.0 and save as Parquet to raw layer"
     existing_cluster_id: ${var.cluster_id}
+
+    # -- Option A: notebook_task (default — interactive) --
     notebook_task:
       notebook_path: ${workspace.root_path}/notebooks/salesforce_ingestion
       source: WORKSPACE
       base_parameters:
         config_path: "/Workspace/Shared/pipeline_config.yaml"
         trade_date: "{{job.parameter.trade_date}}"
+
+    # -- Option B: python_wheel_task (uncomment to use) --
+    # python_wheel_task:
+    #   package_name: databricks_ingestion_etl_pipeline
+    #   entry_point: entry_points.salesforce_ingestion_entry:main
+    #   parameters:
+    #     - "--config_path"
+    #     - "/Workspace/Shared/pipeline_config.yaml"
+    #     - "--trade_date"
+    #     - "{{job.parameter.trade_date}}"
+
     timeout_seconds: 3600
     max_retries: 3
     min_retry_interval_millis: 300000
@@ -55,12 +76,25 @@ tasks:
   - task_key: pmm_ingestion
     description: "Extract PMM data via REST API and save as Parquet to raw layer"
     existing_cluster_id: ${var.cluster_id}
+
+    # -- Option A: notebook_task (default — interactive) --
     notebook_task:
       notebook_path: ${workspace.root_path}/notebooks/pmm_ingestion
       source: WORKSPACE
       base_parameters:
         config_path: "/Workspace/Shared/pipeline_config.yaml"
         trade_date: "{{job.parameter.trade_date}}"
+
+    # -- Option B: python_wheel_task (uncomment to use) --
+    # python_wheel_task:
+    #   package_name: databricks_ingestion_etl_pipeline
+    #   entry_point: entry_points.pmm_ingestion_entry:main
+    #   parameters:
+    #     - "--config_path"
+    #     - "/Workspace/Shared/pipeline_config.yaml"
+    #     - "--trade_date"
+    #     - "{{job.parameter.trade_date}}"
+
     timeout_seconds: 3600
     max_retries: 3
     min_retry_interval_millis: 300000
@@ -75,12 +109,25 @@ tasks:
       - task_key: pmm_ingestion
         outcome: success
     existing_cluster_id: ${var.cluster_id}
+
+    # -- Option A: notebook_task (default — interactive) --
     notebook_task:
       notebook_path: ${workspace.root_path}/notebooks/etl_pipeline
       source: WORKSPACE
       base_parameters:
         config_path: "/Workspace/Shared/pipeline_config.yaml"
         trade_date: "{{job.parameter.trade_date}}"
+
+    # -- Option B: python_wheel_task (uncomment to use) --
+    # python_wheel_task:
+    #   package_name: databricks_ingestion_etl_pipeline
+    #   entry_point: entry_points.etl_pipeline_entry:main
+    #   parameters:
+    #     - "--config_path"
+    #     - "/Workspace/Shared/pipeline_config.yaml"
+    #     - "--trade_date"
+    #     - "{{job.parameter.trade_date}}"
+
     timeout_seconds: 7200
     max_retries: 2
     min_retry_interval_millis: 300000
