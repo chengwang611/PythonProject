@@ -80,38 +80,45 @@ azure-datbricks-ingestion-etl-pipeline/
 ├── databricks.yml                     # Databricks Asset Bundle (DAB) root config
 │
 ├── src/
-│   ├── __init__.py
-│   ├── config.py                      # Configuration loader
-│   │
-│   ├── ingestion/
-│   │   ├── __init__.py
-│   │   ├── auth.py                    # OAuth2 / token management
-│   │   ├── salesforce_bulk.py         # Salesforce Bulk API 2.0 client
-│   │   ├── pmm_api.py                 # PMM REST API client
-│   │   └── base_rest.py              # Generic REST pagination helper
-│   │
-│   ├── raw_writer/
-│   │   ├── __init__.py
-│   │   └── parquet_writer.py          # Write DataFrames as Parquet to raw layer
-│   │
-│   ├── etl/
-│   │   ├── __init__.py
-│   │   ├── validator.py               # Schema & data quality validation
-│   │   ├── transformer.py             # Filter, join, aggregation logic
-│   │   └── delta_writer.py            # Write to Delta tables with Unity Catalog
-│   │
-│   ├── entry_points/                  # python_wheel_task entry points
-│   │   ├── __init__.py
-│   │   ├── salesforce_ingestion_entry.py
-│   │   ├── pmm_ingestion_entry.py
-│   │   └── etl_pipeline_entry.py
-│   │
-│   └── utils/
+│   └── bank_etl/                      # Top-level package (src/ is source root only)
 │       ├── __init__.py
-│       ├── spark_utils.py             # Spark session builder
-│       └── logging_utils.py           # Logging configuration
+│       ├── config.py                  # Configuration loader
+│       │
+│       ├── ingestion/
+│       │   ├── __init__.py
+│       │   ├── auth.py                # OAuth2 / token management
+│       │   ├── salesforce_bulk.py     # Salesforce Bulk API 2.0 client
+│       │   ├── pmm_api.py             # PMM REST API client
+│       │   └── base_rest.py           # Generic REST pagination helper
+│       │
+│       ├── raw_writer/
+│       │   ├── __init__.py
+│       │   └── parquet_writer.py      # Write DataFrames as Parquet to raw layer
+│       │
+│       ├── etl/
+│       │   ├── __init__.py
+│       │   ├── validator.py           # Schema & data quality validation
+│       │   ├── transformer.py         # Filter, join, aggregation logic
+│       │   └── delta_writer.py        # Write to Delta tables with Unity Catalog
+│       │
+│       ├── orchestrators/             # Shared business logic (reused by notebooks & entry_points)
+│       │   ├── __init__.py
+│       │   ├── salesforce_runner.py   # Salesforce ingestion workflow
+│       │   ├── pmm_runner.py          # PMM ingestion workflow
+│       │   └── etl_runner.py          # ETL pipeline workflow
+│       │
+│       ├── entry_points/              # python_wheel_task entry points (thin wrappers)
+│       │   ├── __init__.py
+│       │   ├── salesforce_ingestion_entry.py
+│       │   ├── pmm_ingestion_entry.py
+│       │   └── etl_pipeline_entry.py
+│       │
+│       └── utils/
+│           ├── __init__.py
+│           ├── spark_utils.py         # Spark session builder
+│           └── logging_utils.py       # Logging configuration
 │
-├── notebooks/                         # notebook_task entry points
+├── notebooks/                         # notebook_task entry points (thin wrappers)
 │   ├── salesforce_ingestion.py        # Databricks notebook: SF → Raw
 │   ├── pmm_ingestion.py               # Databricks notebook: PMM → Raw
 │   └── etl_pipeline.py                # Databricks notebook: Raw → Silver
@@ -133,27 +140,58 @@ azure-datbricks-ingestion-etl-pipeline/
     └── deploy_workflows.py            # Databricks REST API deployment helper (legacy)
 ```
 
-## 5. Task Execution: Notebook vs Python Wheel
+## 5. Architecture: Orchestrator Pattern (Shared Business Logic)
 
-Databricks Workflows support two task types for running Python code. This project provides **both** so teams can choose based on their needs.
+All business logic lives in reusable **orchestrator modules** under [`src/bank_etl/orchestrators/`](src/bank_etl/orchestrators/). Each orchestrator exposes a single `run(**kwargs) -> dict` function that contains the complete workflow. Both notebooks and entry_points are **thin wrappers** (~15–20 lines) that only handle parameter plumbing (widgets or argparse) and delegate everything else to the same orchestrator.
 
-### 5.1 `notebook_task` (default — interactive)
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    ORCHESTRATOR LAYER                        │
+│              src/bank_etl/orchestrators/*.py                 │
+│                                                              │
+│  salesforce_runner.run()   pmm_runner.run()   etl_runner.run()│
+│        ▲                       ▲                    ▲        │
+│        │                       │                    │        │
+│  ┌─────┴──────┐          ┌─────┴──────┐      ┌─────┴──────┐ │
+│  │ notebooks/ │          │ notebooks/ │      │ notebooks/ │ │
+│  │ (widgets)  │          │ (widgets)  │      │ (widgets)  │ │
+│  └────────────┘          └────────────┘      └────────────┘ │
+│  ┌────────────┐          ┌────────────┐      ┌────────────┐ │
+│  │entry_points│          │entry_points│      │entry_points│ │
+│  │ (argparse) │          │ (argparse) │      │ (argparse) │ │
+│  └────────────┘          └────────────┘      └────────────┘ │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Key benefits:**
+- **DRY**: Business logic is written once, tested once, and reused everywhere.
+- **Testable**: Orchestrators are plain Python — testable with `pytest` without Databricks.
+- **Consistent**: Notebooks and wheel tasks produce identical results since they call the same `run()` function.
+- **Maintainable**: Fix a bug in one place; both execution modes get the fix automatically.
+
+## 6. Task Execution: Notebook vs Python Wheel
+
+Databricks Workflows support two task types for running Python code. This project provides **both** so teams can choose based on their needs. Both delegate to the same orchestrator modules.
+
+### 6.1 `notebook_task` (default — interactive)
 
 - Uses `dbutils.widgets` for parameter passing
 - Produces cell-by-cell output in the Databricks UI
 - Supports interactive re-run of individual cells for debugging
-- Defined in [`notebooks/`](notebooks/) as Databricks notebook files
+- Defined in [`notebooks/`](notebooks/) as Databricks notebook files (~15 lines each)
+- Calls the same `bank_etl.orchestrators.*.run()` function as the wheel tasks
 
-### 5.2 `python_wheel_task` (alternative — stateless)
+### 6.2 `python_wheel_task` (alternative — stateless)
 
 - Uses `argparse` for CLI-style parameter passing
 - Runs as a plain Python function — no `dbutils` dependency
 - **Testable locally** with `pytest` without a Databricks runtime
 - **CI-friendly**: the same entry point can run in GitHub Actions for integration tests
-- Defined in [`src/entry_points/`](src/entry_points/) as standard Python modules
+- Defined in [`src/bank_etl/entry_points/`](src/bank_etl/entry_points/) as standard Python modules (~20 lines each)
 - Registered as `console_scripts` in [`setup.py`](setup.py)
+- Calls the same `bank_etl.orchestrators.*.run()` function as the notebooks
 
-### 5.3 Comparison
+### 6.3 Comparison
 
 | Feature | `notebook_task` | `python_wheel_task` |
 |---------|----------------|---------------------|
@@ -163,8 +201,9 @@ Databricks Workflows support two task types for running Python code. This projec
 | CI integration | ❌ Notebook-specific | ✅ Standard Python |
 | State isolation | ⚠️ Cells share state | ✅ Stateless function |
 | UI output | ✅ Rich cell output | ⚠️ stdout only |
+| Business logic | Delegates to orchestrator | Delegates to orchestrator |
 
-### 5.4 Switching Between Task Types
+### 6.4 Switching Between Task Types
 
 In the DAB job YAMLs ([`resources/daily_ingestion_etl_pipeline.job.yml`](resources/daily_ingestion_etl_pipeline.job.yml) and [`resources/etl_only_pipeline.job.yml`](resources/etl_only_pipeline.job.yml)), each task has both options. Comment out one block and uncomment the other:
 
@@ -180,7 +219,7 @@ notebook_task:
 # -- Option B: python_wheel_task --
 # python_wheel_task:
 #   package_name: databricks_ingestion_etl_pipeline
-#   entry_point: entry_points.salesforce_ingestion_entry:main
+#   entry_point: bank_etl.entry_points.salesforce_ingestion_entry:main
 #   parameters:
 #     - "--config_path"
 #     - "/Workspace/Shared/pipeline_config.yaml"
@@ -188,43 +227,48 @@ notebook_task:
 #     - "{{job.parameter.trade_date}}"
 ```
 
-## 6. Data Flow
+## 7. Data Flow
 
-### 5.1 Salesforce Ingestion Flow
-```
-1. Databricks Workflow triggers salesforce_ingestion notebook daily
-2. Notebook reads config (SF credentials, objects to extract, trade_date)
-3. SalesforceBulkClient authenticates via OAuth2 (JWT or password grant)
-4. Creates Bulk API 2.0 job for each configured object
-5. Downloads results as JSON, converts to Spark DataFrame
-6. Validates schema, adds metadata columns (ingestion_ts, trade_date)
-7. Writes as Parquet to /raw/salesforce/trade_date={date}/
-```
+All data flows are implemented in the orchestrator modules under [`src/bank_etl/orchestrators/`](src/bank_etl/orchestrators/). Notebooks and entry_points are thin wrappers that delegate to these orchestrators.
 
-### 5.2 PMM Ingestion Flow
+### 7.1 Salesforce Ingestion Flow
 ```
-1. Databricks Workflow triggers pmm_ingestion notebook daily
-2. Notebook reads config (PMM base URL, endpoints, trade_date)
-3. PmmApiClient authenticates via API key / OAuth2
-4. Paginates through all records for each endpoint
-5. Converts JSON response to Spark DataFrame
-6. Validates schema, adds metadata columns
-7. Writes as Parquet to /raw/pmm/trade_date={date}/
+1. Databricks Workflow triggers salesforce_ingestion (notebook or wheel task)
+2. Thin wrapper delegates to bank_etl.orchestrators.salesforce_runner.run()
+3. Orchestrator reads config (SF credentials, objects to extract, trade_date)
+4. SalesforceBulkClient authenticates via OAuth2 (JWT or password grant)
+5. Creates Bulk API 2.0 job for each configured object
+6. Downloads results as JSON, converts to Spark DataFrame
+7. Validates schema, adds metadata columns (ingestion_ts, trade_date)
+8. Writes as Parquet to /raw/salesforce/trade_date={date}/
 ```
 
-### 5.3 ETL Flow (Raw → Silver)
+### 7.2 PMM Ingestion Flow
 ```
-1. Databricks Workflow triggers etl_pipeline notebook (depends on both ingestions)
-2. Reads raw Parquet for trade_date from both /raw/salesforce and /raw/pmm
-3. Validates data quality (null checks, schema enforcement, range checks)
-4. Applies business filters (e.g., exclude test records, inactive accounts)
-5. Joins Salesforce + PMM datasets on common keys
-6. Performs aggregations (daily metrics, summaries)
-7. Writes result as Delta table to Unity Catalog (<catalog>.silver.<table>)
-8. Runs OPTIMIZE on Delta tables
+1. Databricks Workflow triggers pmm_ingestion (notebook or wheel task)
+2. Thin wrapper delegates to bank_etl.orchestrators.pmm_runner.run()
+3. Orchestrator reads config (PMM base URL, endpoints, trade_date)
+4. PmmApiClient authenticates via API key / OAuth2
+5. Paginates through all records for each endpoint
+6. Converts JSON response to Spark DataFrame
+7. Validates schema, adds metadata columns
+8. Writes as Parquet to /raw/pmm/trade_date={date}/
 ```
 
-## 6. Unity Catalog Integration
+### 7.3 ETL Flow (Raw → Silver)
+```
+1. Databricks Workflow triggers etl_pipeline (notebook or wheel task, depends on both ingestions)
+2. Thin wrapper delegates to bank_etl.orchestrators.etl_runner.run()
+3. Orchestrator reads raw Parquet for trade_date from both /raw/salesforce and /raw/pmm
+4. Validates data quality (null checks, schema enforcement, range checks)
+5. Applies business filters (e.g., exclude test records, inactive accounts)
+6. Joins Salesforce + PMM datasets on common keys
+7. Performs aggregations (daily metrics, summaries)
+8. Writes result as Delta table to Unity Catalog (<catalog>.silver.<table>)
+9. Runs OPTIMIZE on Delta tables
+```
+
+## 8. Unity Catalog Integration
 
 Silver layer tables are registered under Unity Catalog with three-level namespace:
 - `catalog`: Configurable (e.g., `main` or `prod`)
@@ -238,11 +282,11 @@ df.write.mode("overwrite") \
     .saveAsTable(f"{catalog}.silver.{table_name}")
 ```
 
-## 7. CI/CD Pipeline (GitHub Actions)
+## 9. CI/CD Pipeline (GitHub Actions)
 
 Two deployment methods are available. DAB is the recommended approach.
 
-### 7.1 Databricks Asset Bundle (DAB) — Recommended
+### 9.1 Databricks Asset Bundle (DAB) — Recommended
 
 ```
 Push to main →
@@ -260,7 +304,7 @@ Push to main →
   - `databricks bundle run -t <target> <job_name>` — trigger a job run
   - `databricks bundle destroy -t <target>` — tear down all deployed resources
 
-### 7.2 REST API (Legacy)
+### 9.2 REST API (Legacy)
 
 ```
 Push to main →
@@ -274,7 +318,7 @@ Push to main →
 - **Workflow file**: [`.github/workflows/deploy-databricks-pipeline.yml`](.github/workflows/deploy-databricks-pipeline.yml)
 - **Deployment script**: [`scripts/deploy_workflows.py`](scripts/deploy_workflows.py)
 
-### 7.3 Target Environments
+### 9.3 Target Environments
 
 | Target    | Workspace Path                                              | Trigger              |
 |-----------|-------------------------------------------------------------|----------------------|
@@ -282,11 +326,11 @@ Push to main →
 | `staging` | `/Workspace/Shared/.bundle/ingestion-etl-pipeline/staging`  | Manual (workflow_dispatch) |
 | `prod`    | `/Workspace/Shared/.bundle/ingestion-etl-pipeline/prod`     | Manual (workflow_dispatch) |
 
-## 8. Configuration
+## 10. Configuration
 
 All sensitive values (credentials, storage keys) are stored as **Databricks Secrets** and referenced via `dbutils.secrets.get()`. Non-sensitive config is in `config.yaml` mounted to the cluster or passed as notebook parameters.
 
-## 9. Scheduling
+## 11. Scheduling
 
 | Job Name                          | Schedule (UTC) | Description                        |
 |-----------------------------------|----------------|------------------------------------|
@@ -298,7 +342,7 @@ The `daily_ingestion_etl_pipeline` job runs three tasks:
 2. **pmm_ingestion** (02:00, parallel) — extracts PMM data to raw Parquet
 3. **etl_pipeline** (depends on both above) — validates, transforms, and writes to Silver Delta tables
 
-## 10. Error Handling & Monitoring
+## 12. Error Handling & Monitoring
 
 - All notebooks use try/except with structured logging
 - Failed tasks in Databricks Workflows can trigger email alerts

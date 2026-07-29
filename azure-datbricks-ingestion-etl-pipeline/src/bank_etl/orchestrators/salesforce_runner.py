@@ -1,67 +1,62 @@
-"""python_wheel_task entry point: Salesforce Ingestion.
+"""Orchestrator: Salesforce Ingestion.
 
-Usage (via Databricks python_wheel_task)::
-
-    package_name: databricks_ingestion_etl_pipeline
-    entry_point:  entry_points.salesforce_ingestion_entry:main
-    parameters:
-      - "--config_path"
-      - "/Workspace/Shared/pipeline_config.yaml"
-      - "--trade_date"
-      - "{{job.parameter.trade_date}}"
+Contains all business logic for extracting Salesforce data via Bulk API 2.0
+and writing it as Parquet to the raw (bronze) layer.  Shared by the notebook
+and the wheel-task entry point.
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import logging
-import sys
-from datetime import date, timedelta
+from typing import Any, Dict, List, Optional
 
-from src.config import load_config
-from src.ingestion.auth import OAuth2Client
-from src.ingestion.salesforce_bulk import SalesforceBulkClient
-from src.raw_writer.parquet_writer import ParquetWriter
-from src.utils.logging_utils import setup_logging
-from src.utils.spark_utils import get_or_create_spark
+from bank_etl.config import PipelineConfig, load_config
+from bank_etl.ingestion.auth import OAuth2Client
+from bank_etl.ingestion.salesforce_bulk import SalesforceBulkClient
+from bank_etl.raw_writer.parquet_writer import ParquetWriter
+from bank_etl.utils.logging_utils import setup_logging
+from bank_etl.utils.spark_utils import get_or_create_spark
 
 logger = logging.getLogger("salesforce_ingestion")
 
 
-def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Salesforce Bulk API ingestion")
-    parser.add_argument(
-        "--config_path",
-        default="/Workspace/Shared/pipeline_config.yaml",
-        help="Path to pipeline_config.yaml in workspace",
-    )
-    parser.add_argument(
-        "--trade_date",
-        default=(date.today() - timedelta(days=1)).isoformat(),
-        help="Trade date in YYYY-MM-DD format (default: yesterday)",
-    )
-    parser.add_argument(
-        "--objects",
-        default="",
-        help="Comma-separated SF objects (empty = all configured)",
-    )
-    return parser.parse_args(argv)
+def run(
+    config_path: str = "/Workspace/Shared/pipeline_config.yaml",
+    trade_date: str = "",
+    objects: str = "",
+) -> Dict[str, Any]:
+    """Execute the full Salesforce ingestion workflow.
 
+    Parameters
+    ----------
+    config_path : str
+        Path to ``pipeline_config.yaml`` in the workspace.
+    trade_date : str
+        Trade date as ``YYYY-MM-DD``.  Empty string defaults to yesterday.
+    objects : str
+        Comma-separated list of Salesforce object names.  Empty = all configured.
 
-def main(argv: list[str] | None = None) -> None:
-    """Entry point for the Salesforce ingestion wheel task."""
+    Returns
+    -------
+    dict
+        Summary with keys ``status``, ``trade_date``, ``objects``, ``record_counts``.
+    """
     setup_logging()
-    args = _parse_args(argv)
+
+    # Resolve trade_date default
+    if not trade_date:
+        from datetime import date, timedelta
+        trade_date = (date.today() - timedelta(days=1)).isoformat()
 
     logger.info("=" * 60)
-    logger.info("Salesforce Ingestion — trade_date=%s", args.trade_date)
+    logger.info("Salesforce Ingestion — trade_date=%s", trade_date)
     logger.info("=" * 60)
 
     # ------------------------------------------------------------------
     # Load configuration & Spark
     # ------------------------------------------------------------------
-    config = load_config(args.config_path)
+    config: PipelineConfig = load_config(config_path)
     spark = get_or_create_spark("SalesforceIngestion")
 
     # ------------------------------------------------------------------
@@ -79,17 +74,17 @@ def main(argv: list[str] | None = None) -> None:
     # ------------------------------------------------------------------
     # Build SOQL queries per object
     # ------------------------------------------------------------------
-    objects_to_extract = (
-        [o.strip() for o in args.objects.split(",") if o.strip()]
-        if args.objects
+    objects_to_extract: List[str] = (
+        [o.strip() for o in objects.split(",") if o.strip()]
+        if objects
         else sf_cfg.objects
     )
 
-    queries = {}
+    queries: Dict[str, str] = {}
     for obj in objects_to_extract:
         soql = (
             f"SELECT FIELDS(ALL) FROM {obj} "
-            f"WHERE LastModifiedDate >= {args.trade_date}T00:00:00Z "
+            f"WHERE LastModifiedDate >= {trade_date}T00:00:00Z "
             f"LIMIT 50000000"
         )
         queries[obj] = soql
@@ -103,7 +98,7 @@ def main(argv: list[str] | None = None) -> None:
         oauth_client=oauth,
         api_version=sf_cfg.api_version,
     )
-    results = bulk_client.run_queries(queries)
+    results: Dict[str, List[Dict[str, Any]]] = bulk_client.run_queries(queries)
 
     # ------------------------------------------------------------------
     # Write to raw layer as Parquet
@@ -122,25 +117,19 @@ def main(argv: list[str] | None = None) -> None:
             df=df,
             source="salesforce",
             table_name=obj_name.lower(),
-            trade_date=args.trade_date,
+            trade_date=trade_date,
             mode="overwrite",
         )
 
     # ------------------------------------------------------------------
     # Summary
     # ------------------------------------------------------------------
-    logger.info("Salesforce ingestion complete for trade_date=%s", args.trade_date)
+    logger.info("Salesforce ingestion complete for trade_date=%s", trade_date)
     logger.info("Objects processed: %s", objects_to_extract)
 
-    # Databricks python_wheel_task captures stdout; print JSON for downstream
-    summary = {
+    return {
         "status": "success",
-        "trade_date": args.trade_date,
+        "trade_date": trade_date,
         "objects": objects_to_extract,
         "record_counts": {k: len(v) for k, v in results.items()},
     }
-    print(json.dumps(summary))
-
-
-if __name__ == "__main__":
-    main()

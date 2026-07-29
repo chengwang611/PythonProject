@@ -31,9 +31,9 @@ setup(
     ],
     entry_points={
         "console_scripts": [
-            "salesforce-ingestion=entry_points.salesforce_ingestion_entry:main",
-            "pmm-ingestion=entry_points.pmm_ingestion_entry:main",
-            "etl-pipeline=entry_points.etl_pipeline_entry:main",
+            "salesforce-ingestion=bank_etl.entry_points.salesforce_ingestion_entry:main",
+            "pmm-ingestion=bank_etl.entry_points.pmm_ingestion_entry:main",
+            "etl-pipeline=bank_etl.entry_points.etl_pipeline_entry:main",
         ],
     },
 )

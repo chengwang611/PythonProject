@@ -57,7 +57,7 @@ tasks:
     # -- Option B: python_wheel_task (uncomment to use) --
     # python_wheel_task:
     #   package_name: databricks_ingestion_etl_pipeline
-    #   entry_point: entry_points.etl_pipeline_entry:main
+    #   entry_point: bank_etl.entry_points.etl_pipeline_entry:main
     #   parameters:
     #     - "--config_path"
     #     - "/Workspace/Shared/pipeline_config.yaml"

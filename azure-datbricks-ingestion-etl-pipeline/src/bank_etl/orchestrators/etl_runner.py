@@ -1,65 +1,62 @@
-"""python_wheel_task entry point: ETL Pipeline (Raw → Silver).
+"""Orchestrator: ETL Pipeline (Raw → Silver).
 
-Usage (via Databricks python_wheel_task)::
-
-    package_name: databricks_ingestion_etl_pipeline
-    entry_point:  entry_points.etl_pipeline_entry:main
-    parameters:
-      - "--config_path"
-      - "/Workspace/Shared/pipeline_config.yaml"
-      - "--trade_date"
-      - "{{job.parameter.trade_date}}"
+Contains all business logic for reading raw Parquet data from both Salesforce
+and PMM, validating, filtering, joining, aggregating, and writing the result as
+Delta tables managed by Unity Catalog.  Shared by the notebook and the
+wheel-task entry point.
 """
 
 from __future__ import annotations
 
-import argparse
-import json
 import logging
-from datetime import date, timedelta
-from typing import Dict
+from typing import Any, Dict, List
 
 from pyspark.sql import DataFrame
 
-from src.config import load_config
-from src.etl.delta_writer import DeltaWriter
-from src.etl.transformer import DataTransformer
-from src.etl.validator import DataValidator
-from src.raw_writer.parquet_writer import ParquetWriter
-from src.utils.logging_utils import setup_logging
-from src.utils.spark_utils import get_or_create_spark
+from bank_etl.config import PipelineConfig, load_config
+from bank_etl.etl.delta_writer import DeltaWriter
+from bank_etl.etl.transformer import DataTransformer
+from bank_etl.etl.validator import DataValidator
+from bank_etl.utils.logging_utils import setup_logging
+from bank_etl.utils.spark_utils import get_or_create_spark
 
 logger = logging.getLogger("etl_pipeline")
 
 
-def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="ETL Pipeline: Raw → Silver")
-    parser.add_argument(
-        "--config_path",
-        default="/Workspace/Shared/pipeline_config.yaml",
-        help="Path to pipeline_config.yaml in workspace",
-    )
-    parser.add_argument(
-        "--trade_date",
-        default=(date.today() - timedelta(days=1)).isoformat(),
-        help="Trade date in YYYY-MM-DD format (default: yesterday)",
-    )
-    return parser.parse_args(argv)
+def run(
+    config_path: str = "/Workspace/Shared/pipeline_config.yaml",
+    trade_date: str = "",
+) -> Dict[str, Any]:
+    """Execute the full ETL pipeline (Raw → Silver).
 
+    Parameters
+    ----------
+    config_path : str
+        Path to ``pipeline_config.yaml`` in the workspace.
+    trade_date : str
+        Trade date as ``YYYY-MM-DD``.  Empty string defaults to yesterday.
 
-def main(argv: list[str] | None = None) -> None:
-    """Entry point for the ETL pipeline wheel task."""
+    Returns
+    -------
+    dict
+        Summary with keys ``status``, ``trade_date``, ``sf_tables_processed``,
+        ``pmm_tables_processed``.
+    """
     setup_logging()
-    args = _parse_args(argv)
+
+    # Resolve trade_date default
+    if not trade_date:
+        from datetime import date, timedelta
+        trade_date = (date.today() - timedelta(days=1)).isoformat()
 
     logger.info("=" * 60)
-    logger.info("ETL Pipeline (Raw → Silver) — trade_date=%s", args.trade_date)
+    logger.info("ETL Pipeline (Raw → Silver) — trade_date=%s", trade_date)
     logger.info("=" * 60)
 
     # ------------------------------------------------------------------
     # Load configuration & Spark
     # ------------------------------------------------------------------
-    config = load_config(args.config_path)
+    config: PipelineConfig = load_config(config_path)
     spark = get_or_create_spark("EtlPipeline")
 
     # ------------------------------------------------------------------
@@ -84,28 +81,27 @@ def main(argv: list[str] | None = None) -> None:
 
     sf_tables: Dict[str, DataFrame] = {}
     for obj in config.salesforce.objects:
-        obj_path = f"{config.storage.salesforce_raw_path}/{obj.lower()}/trade_date={args.trade_date}"
+        obj_path = f"{config.storage.salesforce_raw_path}/{obj.lower()}/trade_date={trade_date}"
         try:
             sf_tables[obj.lower()] = spark.read.parquet(obj_path)
             logger.info("  Read salesforce/%s: %d rows", obj.lower(), sf_tables[obj.lower()].count())
         except Exception:
-            logger.warning("  No data for salesforce/%s on %s", obj.lower(), args.trade_date)
+            logger.warning("  No data for salesforce/%s on %s", obj.lower(), trade_date)
 
     pmm_tables: Dict[str, DataFrame] = {}
     for ep in config.pmm.endpoints:
         table_name = ep.strip("/").replace("/", "_").replace("-", "_")
-        ep_path = f"{config.storage.pmm_raw_path}/{table_name}/trade_date={args.trade_date}"
+        ep_path = f"{config.storage.pmm_raw_path}/{table_name}/trade_date={trade_date}"
         try:
             pmm_tables[table_name] = spark.read.parquet(ep_path)
             logger.info("  Read pmm/%s: %d rows", table_name, pmm_tables[table_name].count())
         except Exception:
-            logger.warning("  No data for pmm/%s on %s", table_name, args.trade_date)
+            logger.warning("  No data for pmm/%s on %s", table_name, trade_date)
 
     if not sf_tables and not pmm_tables:
-        msg = f"No raw data found for trade_date={args.trade_date}. Aborting."
+        msg = f"No raw data found for trade_date={trade_date}. Aborting."
         logger.error(msg)
-        print(json.dumps({"status": "skipped", "reason": msg}))
-        return
+        return {"status": "skipped", "reason": msg}
 
     # ------------------------------------------------------------------
     # Step 2: Validate raw data
@@ -119,14 +115,18 @@ def main(argv: list[str] | None = None) -> None:
     # Step 3: Apply business filters
     # ------------------------------------------------------------------
     logger.info("Step 3: Applying business filters …")
-    default_filters = [
+    default_filters: List[str] = [
         "status != 'Deleted'",
         "is_active == true",
     ]
     for name in list(sf_tables):
-        sf_tables[name] = transformer.apply_filters(sf_tables[name], default_filters, table_name=f"sf_{name}")
+        sf_tables[name] = transformer.apply_filters(
+            sf_tables[name], default_filters, table_name=f"sf_{name}"
+        )
     for name in list(pmm_tables):
-        pmm_tables[name] = transformer.apply_filters(pmm_tables[name], default_filters, table_name=f"pmm_{name}")
+        pmm_tables[name] = transformer.apply_filters(
+            pmm_tables[name], default_filters, table_name=f"pmm_{name}"
+        )
 
     # ------------------------------------------------------------------
     # Step 4: Write individual source tables to silver
@@ -134,10 +134,14 @@ def main(argv: list[str] | None = None) -> None:
     logger.info("Step 4: Writing individual source tables to silver …")
     for name, df in sf_tables.items():
         enriched = transformer.add_audit_columns(df, source="salesforce")
-        delta_writer.write_as_table(enriched, table_name=f"salesforce_{name}", mode="overwrite", partition_by="trade_date")
+        delta_writer.write_as_table(
+            enriched, table_name=f"salesforce_{name}", mode="overwrite", partition_by="trade_date"
+        )
     for name, df in pmm_tables.items():
         enriched = transformer.add_audit_columns(df, source="pmm")
-        delta_writer.write_as_table(enriched, table_name=f"pmm_{name}", mode="overwrite", partition_by="trade_date")
+        delta_writer.write_as_table(
+            enriched, table_name=f"pmm_{name}", mode="overwrite", partition_by="trade_date"
+        )
 
     # ------------------------------------------------------------------
     # Step 5: Join Salesforce + PMM data
@@ -152,13 +156,18 @@ def main(argv: list[str] | None = None) -> None:
         if valid_keys:
             joined = transformer.join_datasets(sf_primary, pmm_primary, join_keys=valid_keys, how="inner")
             joined_enriched = transformer.add_audit_columns(joined, source="joined_sf_pmm")
-            delta_writer.write_as_table(joined_enriched, table_name="joined_salesforce_pmm", mode="overwrite", partition_by="trade_date")
+            delta_writer.write_as_table(
+                joined_enriched, table_name="joined_salesforce_pmm", mode="overwrite", partition_by="trade_date"
+            )
             logger.info("Joined dataset written: %d rows", joined.count())
         else:
             logger.warning("Join keys %s not found in both datasets. Skipping join.", join_keys)
     else:
-        logger.warning("Missing primary tables for join (sf=%s, pmm=%s). Skipping join.",
-                       sf_primary is not None, pmm_primary is not None)
+        logger.warning(
+            "Missing primary tables for join (sf=%s, pmm=%s). Skipping join.",
+            sf_primary is not None,
+            pmm_primary is not None,
+        )
 
     # ------------------------------------------------------------------
     # Step 6: Aggregations → daily summary
@@ -172,7 +181,9 @@ def main(argv: list[str] | None = None) -> None:
         if not group_cols:
             logger.warning("No trade_date column in %s — skipping aggregation.", name)
             continue
-        summary = transformer.daily_summary(df, group_by=group_cols, metric_columns=numeric_cols[:10], table_name=f"{name}_daily")
+        summary = transformer.daily_summary(
+            df, group_by=group_cols, metric_columns=numeric_cols[:10], table_name=f"{name}_daily"
+        )
         delta_writer.write_as_table(summary, table_name=f"{name}_daily_summary", mode="overwrite")
 
     # ------------------------------------------------------------------
@@ -188,15 +199,11 @@ def main(argv: list[str] | None = None) -> None:
     # ------------------------------------------------------------------
     # Summary
     # ------------------------------------------------------------------
-    logger.info("ETL pipeline complete for trade_date=%s", args.trade_date)
-    summary = {
+    logger.info("ETL pipeline complete for trade_date=%s", trade_date)
+
+    return {
         "status": "success",
-        "trade_date": args.trade_date,
+        "trade_date": trade_date,
         "sf_tables_processed": list(sf_tables.keys()),
         "pmm_tables_processed": list(pmm_tables.keys()),
     }
-    print(json.dumps(summary))
-
-
-if __name__ == "__main__":
-    main()
