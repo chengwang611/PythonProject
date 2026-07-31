@@ -1,4 +1,4 @@
-Metadata-Version: 2.1
+Metadata-Version: 2.4
 Name: databricks-ingestion-etl-pipeline
 Version: 1.0.0
 Summary: Azure Databricks data ingestion and ETL pipeline for Salesforce & PMM
@@ -24,6 +24,14 @@ Requires-Dist: flake8>=6.1.0
 Requires-Dist: black>=23.9.0
 Requires-Dist: isort>=5.12.0
 Requires-Dist: mypy>=1.5.0
+Dynamic: author
+Dynamic: classifier
+Dynamic: description
+Dynamic: description-content-type
+Dynamic: home-page
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
 
 # Azure Databricks Ingestion & ETL Pipeline
 
