@@ -50,6 +50,10 @@ def get_spark_session(
     logger.info("SparkSession created: %s (master=%s)", app_name, spark.sparkContext.master)
     return spark
 
+def hello():
+    """Simple hello function to test Spark session."""
+
+    print(f"Hello from Spark! Version: {SparkSession.builder.getOrCreate().version}")
 
 def get_or_create_spark(app_name: str = "DatabricksIngestionETL") -> SparkSession:
     """Convenience wrapper — returns the active SparkSession or creates one."""
