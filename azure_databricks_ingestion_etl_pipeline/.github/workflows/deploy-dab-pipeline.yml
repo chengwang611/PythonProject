@@ -4,12 +4,12 @@ on:
   push:
     branches: [main, master]
     paths:
-      - 'azure-datbricks-ingestion-etl-pipeline/**'
+      - 'azure_databricks_ingestion_etl_pipeline/**'
       - '.github/workflows/deploy-dab-pipeline.yml'
   pull_request:
     branches: [main, master]
     paths:
-      - 'azure-datbricks-ingestion-etl-pipeline/**'
+      - 'azure_databricks_ingestion_etl_pipeline/**'
   workflow_dispatch:
     inputs:
       environment:
@@ -33,7 +33,7 @@ permissions:
 
 env:
   PYTHON_VERSION: '3.11'
-  PIPELINE_DIR: azure-datbricks-ingestion-etl-pipeline
+  PIPELINE_DIR: azure_databricks_ingestion_etl_pipeline
   DATABRICKS_BUNDLE_VERSION: '0.230.0'
 
 jobs:

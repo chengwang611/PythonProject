@@ -70,7 +70,7 @@ This project implements a **medallion architecture** (Bronze → Silver → Gold
 ## 4. Project Structure
 
 ```
-azure-datbricks-ingestion-etl-pipeline/
+azure_databricks_ingestion_etl_pipeline/
 ├── DESIGN.md                          # This document
 ├── README.md                          # Setup & usage instructions
 ├── Makefile                           # Local dev & deploy commands

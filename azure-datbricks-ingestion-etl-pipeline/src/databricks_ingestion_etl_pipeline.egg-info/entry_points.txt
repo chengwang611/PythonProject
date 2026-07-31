@@ -1,4 +1,0 @@
-[console_scripts]
-etl-pipeline = bank_etl.entry_points.etl_pipeline_entry:main
-pmm-ingestion = bank_etl.entry_points.pmm_ingestion_entry:main
-salesforce-ingestion = bank_etl.entry_points.salesforce_ingestion_entry:main

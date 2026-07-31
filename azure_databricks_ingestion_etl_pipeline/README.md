@@ -1,30 +1,3 @@
-Metadata-Version: 2.1
-Name: databricks-ingestion-etl-pipeline
-Version: 1.0.0
-Summary: Azure Databricks data ingestion and ETL pipeline for Salesforce & PMM
-Home-page: https://github.com/your-org/databricks-ingestion-etl-pipeline
-Author: Data Engineering Team
-Classifier: Development Status :: 4 - Beta
-Classifier: Intended Audience :: Developers
-Classifier: Programming Language :: Python :: 3
-Classifier: Programming Language :: Python :: 3.10
-Classifier: Programming Language :: Python :: 3.11
-Classifier: Programming Language :: Python :: 3.12
-Classifier: Operating System :: OS Independent
-Requires-Python: >=3.10
-Description-Content-Type: text/markdown
-Requires-Dist: pyyaml>=6.0
-Requires-Dist: requests>=2.31.0
-Requires-Dist: pyspark<4.0.0,>=3.5.0
-Requires-Dist: delta-spark>=3.1.0
-Requires-Dist: simple-salesforce>=1.12.0
-Requires-Dist: pytest>=7.4.0
-Requires-Dist: pytest-cov>=4.1.0
-Requires-Dist: flake8>=6.1.0
-Requires-Dist: black>=23.9.0
-Requires-Dist: isort>=5.12.0
-Requires-Dist: mypy>=1.5.0
-
 # Azure Databricks Ingestion & ETL Pipeline
 
 A production-grade **medallion architecture** (Bronze → Silver → Gold) data pipeline on Azure Databricks that ingests data from **Salesforce** (Bulk API 2.0) and **PMM** (REST API), transforms it, and writes curated Delta tables managed by **Unity Catalog**.
@@ -46,7 +19,7 @@ PMM (REST API) ─────────┘
 ## Project Structure
 
 ```
-azure-datbricks-ingestion-etl-pipeline/
+azure_databricks_ingestion_etl_pipeline/
 ├── DESIGN.md                    # Architecture design document
 ├── README.md                    # This file
 ├── Makefile                     # Local dev & deploy commands
@@ -135,7 +108,7 @@ azure-datbricks-ingestion-etl-pipeline/
 
 ```bash
 git clone <repo-url>
-cd azure-datbricks-ingestion-etl-pipeline
+cd azure_databricks_ingestion_etl_pipeline
 
 # Copy and edit configuration
 cp config.example.yaml config.yaml
