@@ -22,7 +22,7 @@ from bank_etl.utils.spark_utils import get_or_create_spark
 
 logger = logging.getLogger("etl_pipeline")
 
-
+## update from databricks
 def run(
     config_path: str = "/Workspace/Shared/pipeline_config.yaml",
     trade_date: str = "",
